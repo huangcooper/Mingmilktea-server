@@ -1,0 +1,25 @@
+# ===== 数据库：含真实生产数据 + 明文默认密码，严禁入库 =====
+*.db
+*.sqlite
+*.sqlite3
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== 打包源（解压前的 tar 球） =====
+*.tar.gz
+*.tar
+
+# ===== 前端依赖 / 构建产物 =====
+node_modules/
+dist/
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+.DS_Store
