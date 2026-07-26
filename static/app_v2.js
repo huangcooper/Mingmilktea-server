@@ -937,15 +937,20 @@ document.getElementById('modalOverlay').addEventListener('click', e => { if (e.t
 /* ============ 仪表盘 ============ */
 async function renderDashboard() {
   let ings = [], inv = [], exp = [], logs = [], was = [];
+  let expAlerts = { total: 0, items: [] };
+  let wasStats = { total: 0, total_quantity: 0, total_amount: 0, by_type: {}, by_ingredient: {}, by_store: {} };
+  let invAlerts = { total: 0, items: [] };
   try {
-    [ings, inv, exp, logs, was] = await Promise.all([
+    [ings, inv, exp, logs, was, expAlerts, wasStats, invAlerts] = await Promise.all([
       apiGet('ingredients'), apiGet('inventory'), apiGet('expiry'), apiGet('logistics'), apiGet('wastage'),
+      apiGet('expiry/alerts'), apiGet('wastage/stats'), apiGet('inventory/alerts'),
     ]);
   } catch (e) { toast(e.message); }
 
   const stockTotal = inv.items.reduce((s, r) => s + (Number(r.current_stock) || 0), 0);
-  const expWarning = exp.items.filter(r => /紧急|警告|关注/.test(r.status)).length;
-  const wastageAmount = was.items.reduce((s, r) => s + (Number(r.amount) || 0), 0);
+  const expWarning = expAlerts.total;
+  const wastageAmount = wasStats.total_amount || 0;
+  const stockAlertCount = invAlerts.total;
 
   // 按类别统计库存
   const byCat = {};
@@ -955,6 +960,22 @@ async function renderDashboard() {
     byCat[i.category].sku++;
     if (invRow) byCat[i.category].stock += Number(invRow.current_stock) || 0;
   });
+
+  const expRows = (expAlerts.items || []).slice(0, 8).map(r => `<tr>
+    <td>${escapeHtml(r.ingredient_name)}</td>
+    <td>${escapeHtml(r.batch_no)}</td>
+    <td>${escapeHtml(r.expiry_date)}</td>
+    <td>${r.days_remaining != null ? (r.days_remaining < 0 ? '已过期' : '剩 ' + r.days_remaining + ' 天') : '-'}</td>
+    <td>${tag(r.status)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">无临期预警</td></tr>';
+
+  const wasTypeRows = Object.entries(wasStats.by_type || {}).map(([t, v]) => `<tr>
+    <td>${escapeHtml(t)}</td><td>${Number(v.qty).toFixed(1)}</td><td>${fmtMoney(v.amt)}</td></tr>`).join('') || '<tr><td colspan="3" class="empty">暂无损耗记录</td></tr>';
+
+  const invRows = (invAlerts.items || []).slice(0, 8).map(a => `<tr>
+    <td>${escapeHtml(a.ingredient_name)}</td>
+    <td>${escapeHtml(a.store_name || '总仓')}</td>
+    <td>${Number(a.current_stock).toFixed(0)} / 安全 ${Number(a.safety_stock).toFixed(0)}</td>
+    <td>${tag(a.severity)}</td></tr>`).join('') || '<tr><td colspan="4" class="empty">库存均在安全线以上</td></tr>';
 
   const html = `
     <div class="stats-row">
@@ -969,8 +990,19 @@ async function renderDashboard() {
         ${Object.entries(byCat).map(([cat, v]) => `<tr><td>${cat}</td><td>${v.sku}</td><td>${v.stock.toLocaleString()}</td></tr>`).join('') || '<tr><td colspan="3" class="empty">暂无数据</td></tr>'}
         </tbody></table></div></div>
       <div class="panel"><div class="panel-header"><h3>⏰ 效期预警 - 临期物料</h3></div>
-        <div class="panel-body"><table><thead><tr><th>物料</th><th>批次号</th><th>到期日期</th><th>状态</th></tr></thead><tbody>
-        ${exp.items.filter(r => /紧急|警告|关注/.test(r.status)).map(r => `<tr><td>${escapeHtml(r.ingredient_name)}</td><td>${escapeHtml(r.batch_no)}</td><td>${escapeHtml(r.expiry_date)}</td><td>${tag(r.status)}</td></tr>`).join('') || '<tr><td colspan="4" class="empty">无临期预警</td></tr>'}
+        <div class="panel-body"><table><thead><tr><th>物料</th><th>批次号</th><th>到期日</th><th>剩余</th><th>状态</th></tr></thead><tbody>
+        ${expRows}
+        </tbody></table></div></div>
+    </div>
+    <div class="grid-2">
+      <div class="panel"><div class="panel-header"><h3>📉 损耗统计（按类型）</h3></div>
+        <div class="panel-body"><table><thead><tr><th>损耗类型</th><th>数量</th><th>金额</th></tr></thead><tbody>
+        ${wasTypeRows}
+        </tbody></table>
+        <div style="margin-top:10px;font-size:13px;color:var(--text-secondary);">合计：损耗 ${Number(wasStats.total_quantity||0).toFixed(1)}，金额 ${fmtMoney(wasStats.total_amount||0)}（${wasStats.total} 条记录）</div></div></div>
+      <div class="panel"><div class="panel-header"><h3>🚨 安全库存预警（${stockAlertCount}）</h3></div>
+        <div class="panel-body"><table><thead><tr><th>物料</th><th>门店</th><th>当前/安全</th><th>状态</th></tr></thead><tbody>
+        ${invRows}
         </tbody></table></div></div>
     </div>
     <div class="panel"><div class="panel-header"><h3>🚚 最近物流动态</h3></div>

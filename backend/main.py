@@ -5,6 +5,7 @@ import os
 import io
 import csv
 import json
+from datetime import datetime, date
 from fastapi import FastAPI, Depends, HTTPException, Request, File, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,6 +97,43 @@ def sync_prep_inventory(materials_json: str, store_id: int, db: Session, deduct:
             inv.status = "低于安全库存"
         else:
             inv.status = "正常"
+
+
+
+def _days_to(today_str, date_str):
+    """计算 today_str 到 date_str 相差天数；date_str 较早则为负；解析失败返回 None"""
+    if not date_str:
+        return None
+    try:
+        a = datetime.strptime(today_str, "%Y-%m-%d").date()
+        b = datetime.strptime(date_str, "%Y-%m-%d").date()
+        return (b - a).days
+    except Exception:
+        return None
+
+
+def compute_expiry_status(expiry_date, warn_days=30, urgent_days=7):
+    """按距到期天数判定效期状态：已过期 / 紧急(<=urgent) / 警告(<=warn) / 关注(<=warn*2) / 正常"""
+    d = _days_to(_today(), expiry_date)
+    if d is None:
+        return "正常"
+    if d < 0:
+        return "已过期"
+    if d <= urgent_days:
+        return "紧急"
+    if d <= warn_days:
+        return "警告"
+    if d <= warn_days * 2:
+        return "关注"
+    return "正常"
+
+
+def recompute_expiry_statuses(db):
+    """扫描全部效期记录，按当前日期重算状态（用于初始化/迁移）"""
+    for r in db.query(models.Expiry).all():
+        r.status = compute_expiry_status(r.expiry_date)
+    db.commit()
+
 
 app = FastAPI(title="奶茶原材料管理系统", version="1.0.0")
 
@@ -476,6 +514,108 @@ def ingredients_export(db: Session = Depends(get_db)):
 
 
 # ============ 通用列表（带名称 join + 搜索 + 过滤） ============
+# ============ 业务规则层：预警 / 统计（须在通用路由之前注册） ============
+
+def _alert_visibility(entity, q, request, db):
+    """非平台用户按组织层级隔离可见数据"""
+    x_user = request.headers.get("x-current-user")
+    acct, user_entity, user_obj = resolve_current_user(x_user, db)
+    if acct and acct.role != "platform" and user_obj:
+        visible_ids = collect_visible_ids(acct.role, user_obj.id, db)
+        q = filter_by_visibility(q, entity, visible_ids, db)
+    return q
+
+
+@app.get("/api/expiry/alerts")
+def expiry_alerts(request: Request, days: int = 60, db: Session = Depends(get_db)):
+    """效期临期/过期预警：返回距到期 <= days 天或已过期批次，按紧急度排序，附剩余天数"""
+    ing_map = {i.id: i.name for i in db.query(models.Ingredient).all()}
+    q = db.query(models.Expiry)
+    q = _alert_visibility("expiry", q, request, db)
+    rows = q.all()
+    out = []
+    for r in rows:
+        d = r.to_dict()
+        d["ingredient_name"] = ing_map.get(r.ingredient_id, "")
+        d["days_remaining"] = _days_to(_today(), r.expiry_date)
+        if r.status == "正常" and (d["days_remaining"] is None or d["days_remaining"] > days):
+            continue
+        out.append(d)
+    order = {"已过期": 0, "紧急": 1, "警告": 2, "关注": 3}
+    out.sort(key=lambda x: (order.get(x.get("status"), 9), x.get("days_remaining") if x.get("days_remaining") is not None else 999))
+    return {"total": len(out), "items": out, "warn_days": days}
+
+
+@app.get("/api/inventory/alerts")
+def inventory_alerts(request: Request, db: Session = Depends(get_db)):
+    """安全库存预警：返回当前库存 < 安全库存的物料（缺货 / 低于安全库存）"""
+    ing_map = {i.id: i.name for i in db.query(models.Ingredient).all()}
+    store_map = {s.id: s.name for s in db.query(models.Store).all()}
+    q = db.query(models.Inventory)
+    q = _alert_visibility("inventory", q, request, db)
+    rows = q.all()
+    out = []
+    for r in rows:
+        cs = r.current_stock or 0
+        s = r.safety_stock or 0
+        if cs >= s:
+            continue
+        d = r.to_dict()
+        d["ingredient_name"] = ing_map.get(r.ingredient_id, "")
+        d["store_name"] = store_map.get(r.store_id, "总仓") if r.store_id else "总仓"
+        d["severity"] = "缺货" if cs <= 0 else "低于安全库存"
+        d["gap"] = max(0, s - cs)
+        out.append(d)
+    out.sort(key=lambda x: (0 if x["severity"] == "缺货" else 1, x.get("gap", 0)), reverse=True)
+    return {"total": len(out), "items": out}
+
+
+@app.get("/api/wastage/stats")
+def wastage_stats(request: Request, db: Session = Depends(get_db),
+                  from_date: str = None, to_date: str = None,
+                  store_id: int = None, ingredient_id: int = None, wtype: str = None):
+    """损耗统计报表：按配料 / 类型 / 门店汇总，支持时间段与过滤"""
+    q = db.query(models.Wastage)
+    q = _alert_visibility("wastage", q, request, db)
+    if from_date:
+        q = q.filter(models.Wastage.date >= from_date)
+    if to_date:
+        q = q.filter(models.Wastage.date <= to_date)
+    if store_id:
+        q = q.filter(models.Wastage.store_id == store_id)
+    if ingredient_id:
+        q = q.filter(models.Wastage.ingredient_id == ingredient_id)
+    if wtype:
+        q = q.filter(models.Wastage.type == wtype)
+    rows = q.all()
+    ing_map = {i.id: i.name for i in db.query(models.Ingredient).all()}
+    store_map = {s.id: s.name for s in db.query(models.Store).all()}
+    total_qty = 0.0
+    total_amt = 0.0
+    by_ingredient = {}
+    by_type = {}
+    by_store = {}
+    for r in rows:
+        q_ = float(r.quantity or 0)
+        a_ = float(r.amount or 0)
+        total_qty += q_
+        total_amt += a_
+        bi = by_ingredient.setdefault(r.ingredient_id, {"qty": 0.0, "amt": 0.0, "name": ing_map.get(r.ingredient_id, "")})
+        bi["qty"] += q_; bi["amt"] += a_
+        bt = by_type.setdefault(r.type or "其他", {"qty": 0.0, "amt": 0.0})
+        bt["qty"] += q_; bt["amt"] += a_
+        bs = by_store.setdefault(r.store_id, {"qty": 0.0, "amt": 0.0, "name": store_map.get(r.store_id, "总仓") if r.store_id else "总仓"})
+        bs["qty"] += q_; bs["amt"] += a_
+    return {
+        "total": len(rows),
+        "total_quantity": round(total_qty, 2),
+        "total_amount": round(total_amt, 2),
+        "by_ingredient": by_ingredient,
+        "by_type": by_type,
+        "by_store": by_store,
+    }
+
+
 @app.get("/api/{entity}")
 def list_items(entity: str, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
@@ -549,6 +689,8 @@ def create_item(entity: str, payload: dict, db: Session = Depends(get_db)):
             data["code"] = prefix + "-" + str(db.query(Model).count() + 1).zfill(4)
     enforce_quota(entity, data, db)
     obj = Model(**data)
+    if entity == "expiry":
+        obj.status = compute_expiry_status(obj.expiry_date)
     db.add(obj)
     db.commit()
     db.refresh(obj)
@@ -574,6 +716,9 @@ def update_item(entity: str, item_id: int, payload: dict, db: Session = Depends(
             sync_prep_inventory(obj.materials, obj.store_id, db, True)
         elif old_status == "已完成" and new_status != "已完成":
             sync_prep_inventory(obj.materials, obj.store_id, db, False)
+    # 效期状态动态重算：按距到期天数判定 正常/关注/警告/紧急/已过期
+    if entity == "expiry":
+        obj.status = compute_expiry_status(obj.expiry_date)
     db.commit()
     db.refresh(obj)
     return obj.to_dict()
@@ -1316,6 +1461,7 @@ def seed():
 
         # 同步账号体系：为各层级已有记录创建统一登录账号（演示用，默认已审批转正）
         sync_accounts(db)
+        recompute_expiry_statuses(db)
         print("[seed] 示例数据写入完成")
     finally:
         db.close()
