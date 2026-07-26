@@ -5,6 +5,9 @@ import os
 import io
 import csv
 import json
+import hashlib
+import secrets
+import re
 from datetime import datetime, date
 from fastapi import FastAPI, Depends, HTTPException, Request, File, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,6 +56,16 @@ def migrate():
         "production_date": "VARCHAR(32)",
         "image_url": "VARCHAR(256)",
     }
+    # 确保审计日志表存在
+    Base.metadata.create_all(bind=engine)
+    # 为 accounts 表补齐强制改密字段（兼容旧库）
+    try:
+        acct_cols = {c["name"] for c in inspector.get_columns("accounts")}
+        if "must_change_password" not in acct_cols:
+            with engine.begin() as conn2:
+                conn2.execute(text("ALTER TABLE accounts ADD COLUMN must_change_password BOOLEAN DEFAULT 0"))
+    except Exception as e:
+        print("[migrate] accounts.must_change_password 迁移失败:", e)
     with engine.begin() as conn:
         for name, ddl in new_cols.items():
             if name not in existing:
@@ -226,6 +239,66 @@ def resolve_current_user(x_current_user: str | None, db: Session):
     EntityModel = MODEL_REGISTRY[entity_name]
     obj = db.query(EntityModel).filter(EntityModel.id == acct.related_id).first()
     return acct, EntityModel, obj
+
+
+def hash_password(pwd: str) -> str:
+    """PBKDF2-SHA256 + 随机盐，返回可安全存储的哈希串"""
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac('sha256', pwd.encode('utf-8'), bytes.fromhex(salt), 100000)
+    return f"pbkdf2${salt}${dk.hex()}"
+
+
+def verify_password(pwd: str, stored: str) -> bool:
+    """校验密码：兼容旧库的明文存储（stored 不含 pbkdf2$ 前缀）"""
+    if not stored:
+        return False
+    if stored.startswith('pbkdf2$'):
+        try:
+            _, salt, dk = stored.split('$', 2)
+            expected = hashlib.pbkdf2_hmac('sha256', pwd.encode('utf-8'), bytes.fromhex(salt), 100000).hex()
+            return expected == dk
+        except Exception:
+            return False
+    return stored == pwd  # 兼容旧明文库
+
+
+def check_pwd_policy(pwd: str):
+    """返回空串表示通过，否则返回错误提示"""
+    if len(pwd) < 8:
+        return '密码至少 8 位'
+    if not re.search(r'[A-Za-z]', pwd) or not re.search(r'\d', pwd):
+        return '密码需同时包含字母和数字'
+    return ''
+
+
+def record_audit(db, request, action, target='', target_id=0, detail='', username=None, role=None):
+    """记录关键操作审计日志（失败不影响主业务流程）"""
+    try:
+        u, r = username, role
+        if (not u) and request:
+            x_user = request.headers.get('x-current-user')
+            if x_user:
+                try:
+                    acct = db.query(models.Account).filter(models.Account.id == int(x_user)).first()
+                    if acct:
+                        u, r = acct.username, acct.role
+                except Exception:
+                    pass
+        ip = ''
+        try:
+            if request and getattr(request, 'client', None):
+                ip = request.client.host
+        except Exception:
+            pass
+        db.add(models.AuditLog(username=u or '', role=r or '', action=action,
+                                target=target, target_id=target_id, detail=detail, ip=ip))
+        db.commit()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print('[audit] 记录失败:', e)
 
 
 def collect_visible_ids(role, entity_id, db):
@@ -788,6 +861,25 @@ def consistency_check(request: Request, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/api/audit-logs")
+def list_audit_logs(request: Request, db: Session = Depends(get_db),
+                    action: str = None, username: str = None,
+                    page: int = 1, page_size: int = 50):
+    """关键操作审计日志：平台看全部，其他角色仅看自己的操作"""
+    q = db.query(models.AuditLog)
+    x_user = request.headers.get("x-current-user")
+    acct, _, _ = resolve_current_user(x_user, db)
+    if acct and acct.role != "platform":
+        q = q.filter(models.AuditLog.username == acct.username)
+    if action:
+        q = q.filter(models.AuditLog.action == action)
+    if username:
+        q = q.filter(models.AuditLog.username == username)
+    total = q.count()
+    rows = q.order_by(models.AuditLog.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return {"total": total, "items": [r.to_dict() for r in rows]}
+
+
 @app.get("/api/{entity}")
 def list_items(entity: str, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
@@ -850,7 +942,7 @@ def get_item(entity: str, item_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/{entity}", status_code=201)
-def create_item(entity: str, payload: dict, db: Session = Depends(get_db)):
+def create_item(entity: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
     cols = get_columns(Model)
     data = {k: v for k, v in payload.items() if k in cols and k not in ("id", "created_at")}
@@ -866,11 +958,13 @@ def create_item(entity: str, payload: dict, db: Session = Depends(get_db)):
     db.add(obj)
     db.commit()
     db.refresh(obj)
+    name = getattr(obj, "name", None) or getattr(obj, "code", None) or str(obj.id)
+    record_audit(db, request, "新增", target=entity, target_id=obj.id, detail=str(name))
     return obj.to_dict()
 
 
 @app.put("/api/{entity}/{item_id}")
-def update_item(entity: str, item_id: int, payload: dict, db: Session = Depends(get_db)):
+def update_item(entity: str, item_id: int, payload: dict, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
     obj = db.query(Model).filter(Model.id == item_id).first()
     if not obj:
@@ -893,17 +987,21 @@ def update_item(entity: str, item_id: int, payload: dict, db: Session = Depends(
         obj.status = compute_expiry_status(obj.expiry_date)
     db.commit()
     db.refresh(obj)
+    name = getattr(obj, "name", None) or getattr(obj, "code", None) or str(obj.id)
+    record_audit(db, request, "修改", target=entity, target_id=obj.id, detail=str(name))
     return obj.to_dict()
 
 
 @app.delete("/api/{entity}/{item_id}")
-def delete_item(entity: str, item_id: int, db: Session = Depends(get_db)):
+def delete_item(entity: str, item_id: int, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
     obj = db.query(Model).filter(Model.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="记录不存在")
+    name = getattr(obj, "name", None) or getattr(obj, "code", None) or str(obj.id)
     db.delete(obj)
     db.commit()
+    record_audit(db, request, "删除", target=entity, target_id=item_id, detail=str(name))
     return {"ok": True, "id": item_id}
 
 
@@ -1155,21 +1253,24 @@ def register(payload: dict, db: Session = Depends(get_db)):
     if db.query(models.Account).filter(models.Account.username == username).first():
         raise HTTPException(status_code=400, detail="该登录账号已被注册，请更换")
     acct = models.Account(
-        username=username, password=password or "123456", phone=phone,
-        role="", status="待激活", registered_at=_today(),
+        username=username, password=hash_password(password or "123456"), phone=phone,
+        role="", status="待激活", registered_at=_today(), must_change_password=True,
     )
     db.add(acct); db.commit(); db.refresh(acct)
+    record_audit(db, None, "注册账号", target="auth", detail="新注册: " + username, username=username)
     return acct.to_dict()
 
 
 @app.post("/auth/login")
-def login(payload: dict, db: Session = Depends(get_db)):
+def login(payload: dict, request: Request, db: Session = Depends(get_db)):
     """登录：校验账号密码，返回账号信息（前端按 status 决定跳转去向）"""
     username = (payload.get("username") or "").strip()
     password = (payload.get("password") or "").strip()
     acct = db.query(models.Account).filter(models.Account.username == username).first()
-    if not acct or acct.password != password:
+    if not acct or not verify_password(password, acct.password):
+        record_audit(db, request, "登录失败", target="auth", detail="账号或密码错误: " + username, username=username)
         raise HTTPException(status_code=401, detail="登录账号或密码错误")
+    record_audit(db, request, "登录成功", target="auth", detail=username, username=acct.username, role=acct.role)
     return acct.to_dict()
 
 
@@ -1301,22 +1402,28 @@ def reject_account(acct_id: int, payload: dict = None, db: Session = Depends(get
 
 @app.post("/auth/change-pwd")
 def change_password(payload: dict, db: Session = Depends(get_db)):
-    """修改当前账号密码"""
+    """修改当前账号密码：校验密码策略，可选校验原密码，清除强制改密标志"""
     acct_id = payload.get("account_id")
-    new_pwd = payload.get("new_password", "").strip()
-    if not new_pwd or len(new_pwd) < 6:
-        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    new_pwd = (payload.get("new_password") or "").strip()
+    old_pwd = (payload.get("old_password") or "").strip()
+    policy = check_pwd_policy(new_pwd)
+    if policy:
+        raise HTTPException(status_code=400, detail=policy)
     acct = db.query(models.Account).filter(models.Account.id == acct_id).first()
     if not acct:
         raise HTTPException(status_code=404, detail="账号不存在")
+    if old_pwd and not verify_password(old_pwd, acct.password):
+        raise HTTPException(status_code=400, detail="原密码不正确")
     # 同步更新关联实体
     if acct.role in ROLE_TO_ENTITY and acct.related_id:
         E = MODEL_REGISTRY[ROLE_TO_ENTITY[acct.role]]
         obj = db.query(E).filter(E.id == acct.related_id).first()
         if obj:
-            obj.password = new_pwd
-    acct.password = new_pwd
+            obj.password = hash_password(new_pwd)
+    acct.password = hash_password(new_pwd)
+    acct.must_change_password = False
     db.commit()
+    record_audit(db, None, "修改密码", target="auth", detail=acct.username, username=acct.username, role=acct.role)
     return {"detail": "密码修改成功"}
 
 
@@ -1349,8 +1456,11 @@ def sync_accounts(db):
                 continue
             if db.query(models.Account).filter(models.Account.username == e.username).first():
                 continue
+            pw = e.password or "123456"
+            if not pw.startswith("pbkdf2$"):
+                pw = hash_password(pw)
             db.add(models.Account(
-                username=e.username, password=e.password or "123456", phone=e.phone or "",
+                username=e.username, password=pw, phone=e.phone or "",
                 role=role, status="正常", related_id=e.id, registered_at=e.registered_at or _today(),
             ))
     platforms = db.query(models.Platform).all()
@@ -1361,8 +1471,9 @@ def sync_accounts(db):
     # 鸣智科技（平台服务商）顶层管理员账号
     if platforms and not db.query(models.Account).filter(models.Account.username == "mingzhi").first():
         db.add(models.Account(
-            username="mingzhi", password="123456", phone=platforms[0].phone,
+            username="mingzhi", password=hash_password("123456"), phone=platforms[0].phone,
             role="platform", status="正常", related_id=platforms[0].id,
+            must_change_password=False,
             level="顶级服务商", registered_at=_today(),
         ))
     db.commit()
@@ -1427,27 +1538,27 @@ def seed():
             models.Supplier(code="SUP-001", name="茗源茶业有限公司", type="贸易商", platform_id=platforms[0].id,
                             contact="陈志远", phone="138****6789", category="茶叶类", level="战略合作",
                             supply_cycle="7天", cooperation_start="2023-01", total_amount=856000, max_brands=3,
-                            username="mingyuan", password="123456", account_status="正常", registered_at="2023-01-10", status="合作中"),
+                            username="mingyuan", password=hash_password("123456"), account_status="正常", registered_at="2023-01-10", status="合作中"),
             models.Supplier(code="SUP-002", name="甜蜜源糖业", type="制造商", platform_id=platforms[0].id,
                             contact="林小红", phone="139****8901", category="糖浆类", level="战略合作",
                             supply_cycle="5天", cooperation_start="2023-03", total_amount=620000, max_brands=3,
-                            username="tianmi", password="123456", account_status="正常", registered_at="2023-03-12", status="合作中"),
+                            username="tianmi", password=hash_password("123456"), account_status="正常", registered_at="2023-03-12", status="合作中"),
             models.Supplier(code="SUP-003", name="光明乳业股份有限公司", type="制造商", platform_id=platforms[0].id,
                             contact="黄大明", phone="137****2345", category="奶制品类", level="核心供应商",
                             supply_cycle="3天", cooperation_start="2022-06", total_amount=1240000, max_brands=2,
-                            username="guangming", password="123456", account_status="正常", registered_at="2022-06-01", status="合作中"),
+                            username="guangming", password=hash_password("123456"), account_status="正常", registered_at="2022-06-01", status="合作中"),
             models.Supplier(code="SUP-004", name="珍珠大王食品", type="贸易商", platform_id=platforms[0].id,
                             contact="吴小军", phone="136****5678", category="小料类", level="一般供应商",
                             supply_cycle="10天", cooperation_start="2024-01", total_amount=180000, max_brands=2,
-                            username="zhenzhu", password="123456", account_status="正常", registered_at="2024-01-15", status="合作中"),
+                            username="zhenzhu", password=hash_password("123456"), account_status="正常", registered_at="2024-01-15", status="合作中"),
             models.Supplier(code="SUP-005", name="鲜果汇供应链", type="贸易商", platform_id=platforms[0].id,
                             contact="周美玲", phone="135****9012", category="水果类", level="核心供应商",
                             supply_cycle="2天", cooperation_start="2023-08", total_amount=420000, max_brands=2,
-                            username="xianguo", password="123456", account_status="正常", registered_at="2023-08-20", status="合作中"),
+                            username="xianguo", password=hash_password("123456"), account_status="正常", registered_at="2023-08-20", status="合作中"),
             models.Supplier(code="SUP-006", name="安佳乳品（中国）", type="制造商", platform_id=platforms[0].id,
                             contact="郑国强", phone="133****3456", category="奶制品类", level="一般供应商",
                             supply_cycle="7天", cooperation_start="2024-03", total_amount=95000, max_brands=1,
-                            username="anjia", password="123456", account_status="停用", registered_at="2024-03-05", status="暂停合作"),
+                            username="anjia", password=hash_password("123456"), account_status="停用", registered_at="2024-03-05", status="暂停合作"),
         ]
         db.add_all(suppliers); db.commit()
         for s in suppliers: db.refresh(s)
@@ -1457,15 +1568,15 @@ def seed():
             models.Brand(code="BR-001", name="茶颜悦色", company="茶颜悦色餐饮管理有限公司",
                          supplier_id=suppliers[0].id, manager="李建国", phone="138****0001", store_count=156,
                          franchise_mode="直营+加盟", created_at_date="2022-01", max_stores=20, status="运营中",
-                         username="chayan", password="123456", account_status="正常", registered_at="2022-01-15"),
+                         username="chayan", password=hash_password("123456"), account_status="正常", registered_at="2022-01-15"),
             models.Brand(code="BR-002", name="蜜雪冰城", company="蜜雪冰城股份有限公司",
                          supplier_id=suppliers[1].id, manager="张伟", phone="139****0002", store_count=320,
                          franchise_mode="直营+加盟", created_at_date="2021-06", max_stores=30, status="运营中",
-                         username="mixue", password="123456", account_status="正常", registered_at="2021-06-20"),
+                         username="mixue", password=hash_password("123456"), account_status="正常", registered_at="2021-06-20"),
             models.Brand(code="BR-003", name="喜茶", company="深圳美西西餐饮管理有限公司",
                          supplier_id=suppliers[2].id, manager="刘洋", phone="137****0003", store_count=89,
                          franchise_mode="直营", created_at_date="2022-03", max_stores=10, status="运营中",
-                         username="xicha", password="123456", account_status="正常", registered_at="2022-03-10"),
+                         username="xicha", password=hash_password("123456"), account_status="正常", registered_at="2022-03-10"),
         ]
         db.add_all(brands); db.commit()
         for b in brands: db.refresh(b)
@@ -1475,19 +1586,19 @@ def seed():
             models.Store(code="ST-001", name="朝阳旗舰店", brand_id=brands[0].id, type="旗舰店",
                          manager="王芳", phone="010-****1234", address="北京市朝阳区建国路88号",
                          area="120㎡", staff_count=8, max_staff=15, status="营业中",
-                         username="chaoyang", password="123456", account_status="正常", registered_at="2022-02-01"),
+                         username="chaoyang", password=hash_password("123456"), account_status="正常", registered_at="2022-02-01"),
             models.Store(code="ST-002", name="海淀中关村店", brand_id=brands[0].id, type="标准店",
                          manager="李红", phone="010-****5678", address="北京市海淀区中关村大街15号",
                          area="80㎡", staff_count=5, max_staff=10, status="营业中",
-                         username="haidian", password="123456", account_status="正常", registered_at="2022-04-12"),
+                         username="haidian", password=hash_password("123456"), account_status="正常", registered_at="2022-04-12"),
             models.Store(code="ST-003", name="西城金融街店", brand_id=brands[1].id, type="标准店",
                          manager="赵强", phone="010-****9012", address="北京市西城区金融街7号",
                          area="60㎡", staff_count=4, max_staff=8, status="营业中",
-                         username="xicheng", password="123456", account_status="正常", registered_at="2022-05-20"),
+                         username="xicheng", password=hash_password("123456"), account_status="正常", registered_at="2022-05-20"),
             models.Store(code="ST-004", name="东城王府井店", brand_id=brands[2].id, type="旗舰店",
                          manager="陈雪", phone="010-****3456", address="北京市东城区王府井大街200号",
                          area="150㎡", staff_count=10, max_staff=12, status="装修中",
-                         username="dongcheng", password="123456", account_status="待激活", registered_at="2023-09-01"),
+                         username="dongcheng", password=hash_password("123456"), account_status="待激活", registered_at="2023-09-01"),
         ]
         db.add_all(stores); db.commit()
         for s in stores: db.refresh(s)
@@ -1535,22 +1646,22 @@ def seed():
         staffs = [
             models.Staff(code="EMP-001", name="王芳", role="店长", store_id=stores[0].id, phone="138****1001",
                          hire_date="2023-03-01", permissions="全部权限", qualification="高级", status="在职",
-                         username="wangfang", password="123456", account_status="正常", registered_at="2023-03-01"),
+                         username="wangfang", password=hash_password("123456"), account_status="正常", registered_at="2023-03-01"),
             models.Staff(code="EMP-002", name="张明", role="制茶师", store_id=stores[0].id, phone="139****1002",
                          hire_date="2023-06-15", permissions="配料/预制/损耗", qualification="中级", status="在职",
-                         username="zhangming", password="123456", account_status="正常", registered_at="2023-06-15"),
+                         username="zhangming", password=hash_password("123456"), account_status="正常", registered_at="2023-06-15"),
             models.Staff(code="EMP-003", name="刘小雪", role="收银员", store_id=stores[0].id, phone="137****1003",
                          hire_date="2024-01-10", permissions="出品/收银", qualification="初级", status="在职",
-                         username="liuxiaoxue", password="123456", account_status="正常", registered_at="2024-01-10"),
+                         username="liuxiaoxue", password=hash_password("123456"), account_status="正常", registered_at="2024-01-10"),
             models.Staff(code="EMP-004", name="李红", role="店长", store_id=stores[1].id, phone="138****2001",
                          hire_date="2023-04-01", permissions="全部权限", qualification="高级", status="在职",
-                         username="lihong", password="123456", account_status="正常", registered_at="2023-04-01"),
+                         username="lihong", password=hash_password("123456"), account_status="正常", registered_at="2023-04-01"),
             models.Staff(code="EMP-005", name="赵强", role="店长", store_id=stores[2].id, phone="138****3001",
                          hire_date="2023-08-01", permissions="全部权限", qualification="中级", status="在职",
-                         username="zhaoqiang", password="123456", account_status="正常", registered_at="2023-08-01"),
+                         username="zhaoqiang", password=hash_password("123456"), account_status="正常", registered_at="2023-08-01"),
             models.Staff(code="EMP-006", name="孙丽丽", role="仓库管理员", store_id=stores[1].id, phone="136****2002",
                          hire_date="2024-03-01", permissions="库存/效期/物流", qualification="中级", status="在职",
-                         username="sunlili", password="123456", account_status="正常", registered_at="2024-03-01"),
+                         username="sunlili", password=hash_password("123456"), account_status="正常", registered_at="2024-03-01"),
         ]
         db.add_all(staffs); db.commit()
 

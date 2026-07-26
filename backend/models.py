@@ -62,6 +62,7 @@ class Account(Base, BaseMixin):
     related_id = mapped_column(Integer, default=0)           # 关联实体 id
     approve_note = mapped_column(String(256), default="")    # 平台审批意见
     registered_at = mapped_column(String(32))
+    must_change_password = mapped_column(Boolean, default=False)  # 首次登录强制改密
 
 
 class Supplier(Base, BaseMixin, AccountMixin):
@@ -266,3 +267,15 @@ class PurchaseOrder(Base, BaseMixin):
     status = mapped_column(String(32), default="待审核")  # 待审核/已拒绝/已通过/已发货/已签收
     approve_note = mapped_column(String(256), default="")
     logistics_id = mapped_column(Integer, ForeignKey("logistics.id"), nullable=True)
+
+
+class AuditLog(Base, BaseMixin):
+    """关键操作审计日志：登录 / 改密 / 业务数据增删改 等"""
+    __tablename__ = "audit_logs"
+    username = mapped_column(String(64), default="")        # 操作人账号
+    role = mapped_column(String(32), default="")            # 角色
+    action = mapped_column(String(64), default="")          # 操作类型
+    target = mapped_column(String(64), default="")          # 操作对象实体
+    target_id = mapped_column(Integer, default=0)           # 操作对象 id
+    detail = mapped_column(String(512), default="")         # 说明
+    ip = mapped_column(String(64), default="")              # 来源 IP

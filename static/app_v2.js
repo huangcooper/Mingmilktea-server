@@ -916,23 +916,24 @@ async function delItem(entity, id) {
 }
 
 /* ============ Modal ============ */
-function showModal(title, bodyHtml, onConfirm, width) {
+function showModal(title, bodyHtml, onConfirm, width, noClose) {
   const w = isMobile() ? '100%' : (width || 680);
   const wStyle = isMobile() ? 'width:100%' : `width:${w}px`;
   const overlay = document.getElementById('modalOverlay');
   document.getElementById('modalContent').innerHTML = `
     <div class="modal" style="${wStyle}">
-    <div class="modal-header"><h3>${escapeHtml(title)}</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="modal-header"><h3>${escapeHtml(title)}</h3>${noClose ? '' : '<button class="modal-close" onclick="closeModal()">✕</button>'}</div>
     <div class="modal-body">${bodyHtml}</div>
     <div class="modal-footer">
-      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      ${noClose ? '' : '<button class="btn btn-outline" onclick="closeModal()">取消</button>'}
       <button class="btn btn-primary" id="modalConfirm">确认</button>
     </div></div>`;
   overlay.classList.add('show');
+  overlay.dataset.noclose = noClose ? '1' : '';
   document.getElementById('modalConfirm').onclick = onConfirm;
 }
 function closeModal() { document.getElementById('modalOverlay').classList.remove('show'); }
-document.getElementById('modalOverlay').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
+document.getElementById('modalOverlay').addEventListener('click', e => { if (e.target === e.currentTarget && !document.getElementById('modalOverlay').dataset.noclose) closeModal(); });
 
 /* ============ 仪表盘 ============ */
 async function renderDashboard() {
@@ -1345,7 +1346,105 @@ const ROUTERS = {
   rejected: renderRejected,
   categories: renderCategories,
   supplier_recon: renderSupplierReconciliation,
+  security: renderSecurity,
 };
+
+async function submitChangePwd(p1, p2, oldPwd) {
+  if (!p1 || p1.length < 8 || !/[A-Za-z]/.test(p1) || !/\d/.test(p1)) { toast('密码至少8位，需含字母和数字'); return false; }
+  if (p1 !== p2) { toast('两次密码不一致'); return false; }
+  try {
+    await authApi('/change-pwd', { method: 'POST', body: JSON.stringify({ account_id: currentUser.id, new_password: p1, old_password: oldPwd || '' }) });
+    return true;
+  } catch (e) { toast(e.message); return false; }
+}
+
+window.forceChangePassword = async function (me) {
+  if (!me) me = currentUser;
+  showModal('🔒 首次登录需修改密码', `<p style="color:#e67e22;margin-bottom:10px;">为保障账号安全，首次登录必须修改初始密码后才能进入系统。</p>
+    <div class="form-group"><label>新密码（至少8位，含字母和数字）</label><input type="password" id="newPwd" placeholder="至少 8 位"></div>
+    <div class="form-group"><label>确认密码</label><input type="password" id="newPwd2" placeholder="再次输入"></div>`,
+    async () => {
+      const p1 = document.getElementById('newPwd').value;
+      const p2 = document.getElementById('newPwd2').value;
+      const ok = await submitChangePwd(p1, p2, '');
+      if (ok) {
+        me.must_change_password = false;
+        setAuth(me); currentUser = me;
+        closeModal();
+        toast('密码修改成功');
+        routeByStatus(me);
+      }
+    }, 520, true);
+  document.getElementById('avatarMenu').classList.remove('show');
+};
+
+async function renderSecurity() {
+  const area = document.getElementById('contentArea');
+  area.innerHTML = `<div class="page-head"><h2>🔐 安全与审计</h2><p class="muted">密码策略、强制改密与关键操作审计日志</p></div>
+    <div class="card-grid">
+      <div class="card">
+        <h3>🔑 我的密码</h3>
+        <p class="muted">当前账号：<b>${escapeHtml(currentUser.username)}</b>（${ROLE_LABEL[currentUser.role] || '未申请'}）</p>
+        <p id="pwdStatus" class="muted"></p>
+        <button class="btn btn-primary" onclick="changeMyPassword()">修改密码</button>
+      </div>
+      <div class="card">
+        <h3>🛡️ 密码策略</h3>
+        <ul class="muted" style="line-height:1.9;">
+          <li>长度至少 8 位</li>
+          <li>需同时包含字母和数字</li>
+          <li>新注册 / 审批通过账号首次登录须修改密码</li>
+          <li>密码以加盐哈希（PBKDF2-SHA256）存储，不保存明文</li>
+        </ul>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px;">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+        <h3 style="margin:0;">📜 操作审计日志</h3>
+        <select id="auditAction" onchange="loadAuditLogs()">
+          <option value="">全部操作</option>
+          <option value="登录成功">登录成功</option>
+          <option value="登录失败">登录失败</option>
+          <option value="新增">新增</option>
+          <option value="修改">修改</option>
+          <option value="删除">删除</option>
+          <option value="修改密码">修改密码</option>
+          <option value="注册账号">注册账号</option>
+        </select>
+        <button class="btn btn-outline" onclick="loadAuditLogs()">刷新</button>
+      </div>
+      <div id="auditTable"></div>
+    </div>`;
+  const st = document.getElementById('pwdStatus');
+  if (currentUser.must_change_password) st.innerHTML = '<span class="tag tag-warning">⚠ 需修改初始密码</span>';
+  else st.innerHTML = '<span class="tag tag-success">✓ 密码状态正常</span>';
+  loadAuditLogs();
+}
+
+async function loadAuditLogs() {
+  const box = document.getElementById('auditTable');
+  if (!box) return;
+  const action = document.getElementById('auditAction') ? document.getElementById('auditAction').value : '';
+  box.innerHTML = '<div class="empty">加载中...</div>';
+  try {
+    const data = await api('/api/audit-logs' + (action ? ('?action=' + encodeURIComponent(action)) : ''));
+    if (!data.items.length) { box.innerHTML = '<div class="empty">暂无审计记录</div>'; return; }
+    const rows = data.items.map(r => `<tr>
+      <td>${escapeHtml(r.created_at || '')}</td>
+      <td>${escapeHtml(r.username || '—')}</td>
+      <td>${escapeHtml(r.role || '')}</td>
+      <td>${escapeHtml(r.action || '')}</td>
+      <td>${escapeHtml(r.target || '')}</td>
+      <td>${escapeHtml(r.detail || '')}</td>
+      <td>${escapeHtml(r.ip || '')}</td>
+    </tr>`).join('');
+    box.innerHTML = `<div class="muted" style="margin-bottom:8px;">共 ${data.total} 条记录</div>
+      <table class="data-table"><thead><tr>
+        <th>时间</th><th>操作人</th><th>角色</th><th>操作</th><th>对象</th><th>详情</th><th>IP</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (e) { box.innerHTML = '<div class="empty">加载失败：' + escapeHtml(e.message) + '</div>'; }
+}
+
 function navigate(page, label) {
   document.getElementById('pageTitle').textContent = label;
   setMobileTabActive(page);
@@ -1391,6 +1490,7 @@ const MOBILE_TABS = [
     { page: 'approval', icon: '✅', label: '账号审批' },
   ]},
   { id: 'settings', icon: '⚙️', label: '设置', action: () => navigate('settings', '系统配置') },
+  { id: 'security', icon: '🔐', label: '安全审计', action: () => navigate('security', '安全与审计') },
 ];
 
 function injectMobileTabBar() {
@@ -1561,6 +1661,7 @@ async function enterSystem(me) {
   document.body.classList.remove('logged-out');
   await updateAuthUI(me);
   injectMobileTabBar();
+  if (me.must_change_password) { forceChangePassword(me); return; }
   routeByStatus(me);
 }
 
@@ -1611,19 +1712,18 @@ window.viewMyProfile = async function () {
 };
 
 window.changeMyPassword = function () {
-  showModal('🔒 修改密码', `<div class="form-group"><label>新密码</label><input type="password" id="newPwd" placeholder="至少 6 位"></div>
+  showModal('🔒 修改密码', `<div class="form-group"><label>原密码</label><input type="password" id="oldPwd" placeholder="请输入原密码"></div>
+    <div class="form-group"><label>新密码（至少8位，含字母和数字）</label><input type="password" id="newPwd" placeholder="至少 8 位"></div>
     <div class="form-group"><label>确认密码</label><input type="password" id="newPwd2" placeholder="再次输入"></div>`,
     async () => {
       const p1 = document.getElementById('newPwd').value;
       const p2 = document.getElementById('newPwd2').value;
-      if (!p1 || p1.length < 6) { toast('密码至少 6 位'); return; }
-      if (p1 !== p2) { toast('两次密码不一致'); return; }
-      try {
-        await authApi('/change-pwd', { method: 'POST', body: JSON.stringify({ account_id: currentUser.id, new_password: p1 }) });
+      const ok = await submitChangePwd(p1, p2, document.getElementById('oldPwd').value);
+      if (ok) {
         toast('密码修改成功，请重新登录');
         closeModal();
         doLogout();
-      } catch (e) { toast(e.message); }
+      }
     });
   document.getElementById('avatarMenu').classList.remove('show');
 };
