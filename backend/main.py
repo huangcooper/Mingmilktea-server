@@ -616,6 +616,178 @@ def wastage_stats(request: Request, db: Session = Depends(get_db),
     }
 
 
+# ===== Phase 3: 供应商对账 + 数据一致性校验 =====
+
+def _visible_po_filter(q, request, db):
+    """采购单可见性：平台看全部；供应商看自己的；门店看自己门店的（OR 语义）"""
+    x_user = request.headers.get("x-current-user")
+    acct, _, user_obj = resolve_current_user(x_user, db)
+    if acct and acct.role != "platform" and user_obj:
+        visible_ids = collect_visible_ids(acct.role, user_obj.id, db)
+        sup_ids = visible_ids.get("suppliers", [])
+        store_ids = visible_ids.get("stores", [])
+        conds = []
+        if sup_ids:
+            conds.append(models.PurchaseOrder.supplier_id.in_(sup_ids))
+        if store_ids:
+            conds.append(models.PurchaseOrder.store_id.in_(store_ids))
+        if conds:
+            q = q.filter(or_(*conds))
+    return q
+
+
+@app.get("/api/suppliers/reconciliation")
+def suppliers_reconciliation(request: Request, db: Session = Depends(get_db)):
+    """供应商对账汇总：按供应商聚合采购单（数量/金额/状态/在途/已收）"""
+    pos = _visible_po_filter(db.query(models.PurchaseOrder), request, db).all()
+    sup_map = {s.id: s.name for s in db.query(models.Supplier).all()}
+    rows = {}
+    for po in pos:
+        sid = po.supplier_id
+        r = rows.setdefault(sid, {
+            "supplier_id": sid, "supplier_name": sup_map.get(sid, f"供应商#{sid}"),
+            "po_count": 0, "by_status": {}, "total_amount": 0.0,
+            "received_qty": 0.0, "in_transit_qty": 0.0,
+        })
+        r["po_count"] += 1
+        st = po.status or "待审核"
+        r["by_status"][st] = r["by_status"].get(st, 0) + 1
+        r["total_amount"] += float(po.total_amount or 0)
+        try:
+            items = json.loads(po.items or "[]")
+        except Exception:
+            items = []
+        qty = sum(float(it.get("q") or 0) for it in items)
+        if st == "已签收":
+            r["received_qty"] += qty
+        elif st == "已发货":
+            r["in_transit_qty"] += qty
+    result = list(rows.values())
+    for r in result:
+        r["total_amount"] = round(r["total_amount"], 2)
+        r["received_qty"] = round(r["received_qty"], 2)
+        r["in_transit_qty"] = round(r["in_transit_qty"], 2)
+    result.sort(key=lambda x: x["total_amount"], reverse=True)
+    return {"total_suppliers": len(result), "rows": result}
+
+
+@app.get("/api/suppliers/{sid}/reconciliation")
+def supplier_reconciliation(sid: int, request: Request, db: Session = Depends(get_db)):
+    """单供应商对账明细：PO 列表 + 关联物流"""
+    sup = db.query(models.Supplier).filter(models.Supplier.id == sid).first()
+    if not sup:
+        raise HTTPException(status_code=404, detail="供应商不存在")
+    pos = db.query(models.PurchaseOrder).filter(models.PurchaseOrder.supplier_id == sid).all()
+    store_map = {s.id: s.name for s in db.query(models.Store).all()}
+    po_rows = []
+    by_status = {}
+    total_amount = 0.0
+    received_qty = 0.0
+    in_transit_qty = 0.0
+    for po in pos:
+        st = po.status or "待审核"
+        by_status[st] = by_status.get(st, 0) + 1
+        total_amount += float(po.total_amount or 0)
+        try:
+            items = json.loads(po.items or "[]")
+        except Exception:
+            items = []
+        qty = sum(float(it.get("q") or 0) for it in items)
+        if st == "已签收":
+            received_qty += qty
+        elif st == "已发货":
+            in_transit_qty += qty
+        log_status = ""
+        if po.logistics_id:
+            lg = db.query(models.Logistics).filter(models.Logistics.id == po.logistics_id).first()
+            log_status = lg.status if lg else ""
+        po_rows.append({
+            "id": po.id, "code": po.code, "store_name": store_map.get(po.store_id, "总仓"),
+            "status": st, "total_amount": round(float(po.total_amount or 0), 2),
+            "items_count": len(items), "qty": round(qty, 2), "logistics_status": log_status,
+        })
+    return {
+        "supplier": {"id": sup.id, "name": sup.name, "code": sup.code},
+        "summary": {
+            "po_count": len(pos), "by_status": by_status,
+            "total_amount": round(total_amount, 2),
+            "received_qty": round(received_qty, 2),
+            "in_transit_qty": round(in_transit_qty, 2),
+        },
+        "pos": po_rows,
+    }
+
+
+@app.get("/api/consistency/check")
+def consistency_check(request: Request, db: Session = Depends(get_db)):
+    """数据一致性校验：负库存 / 过期积压 / 叫货单-物流状态不符 / 低于安全库存"""
+    x_user = request.headers.get("x-current-user")
+    acct, _, user_obj = resolve_current_user(x_user, db)
+    is_platform = not (acct and acct.role != "platform" and user_obj)
+    ing_map = {i.id: i.name for i in db.query(models.Ingredient).all()}
+    store_map = {s.id: s.name for s in db.query(models.Store).all()}
+
+    def _scope_inventory(q):
+        if is_platform:
+            return q
+        vis = collect_visible_ids(acct.role, user_obj.id, db)
+        sids = vis.get("stores", [])
+        return q.filter(models.Inventory.store_id.in_(sids)) if sids else q.filter(text("1=0"))
+
+    def _scope_expiry(q):
+        if is_platform:
+            return q
+        vis = collect_visible_ids(acct.role, user_obj.id, db)
+        sup_ids = vis.get("suppliers", [])
+        if not sup_ids:
+            return q.filter(text("1=0"))
+        ing_ids = [i.id for i in db.query(models.Ingredient).filter(models.Ingredient.supplier_id.in_(sup_ids)).all()]
+        return q.filter(models.Expiry.ingredient_id.in_(ing_ids)) if ing_ids else q.filter(text("1=0"))
+
+    negative_stock = [{"id": v.id, "ingredient_id": v.ingredient_id,
+                       "ingredient_name": ing_map.get(v.ingredient_id, ""),
+                       "store_id": v.store_id, "store_name": store_map.get(v.store_id, "总仓") if v.store_id else "总仓",
+                       "current_stock": v.current_stock}
+                      for v in _scope_inventory(db.query(models.Inventory)).filter(models.Inventory.current_stock < 0).all()]
+
+    expired_backlog = [{"batch_no": e.batch_no, "ingredient_id": e.ingredient_id,
+                        "ingredient_name": ing_map.get(e.ingredient_id, ""),
+                        "remaining_qty": e.remaining_qty, "expiry_date": e.expiry_date}
+                       for e in _scope_expiry(db.query(models.Expiry)).filter(
+                           models.Expiry.status == "已过期", models.Expiry.remaining_qty > 0).all()]
+
+    po_logistics_mismatch = []
+    for po in _visible_po_filter(db.query(models.PurchaseOrder), request, db).filter(models.PurchaseOrder.status == "已签收").all():
+        if po.logistics_id:
+            lg = db.query(models.Logistics).filter(models.Logistics.id == po.logistics_id).first()
+            if not lg or lg.status != "已签收":
+                po_logistics_mismatch.append({"po_id": po.id, "po_code": po.code,
+                                              "po_status": po.status, "logistics_status": lg.status if lg else "无"})
+        else:
+            po_logistics_mismatch.append({"po_id": po.id, "po_code": po.code,
+                                          "po_status": po.status, "logistics_status": "无"})
+
+    low_stock = [{"id": v.id, "ingredient_id": v.ingredient_id,
+                  "ingredient_name": ing_map.get(v.ingredient_id, ""),
+                  "store_id": v.store_id, "store_name": store_map.get(v.store_id, "总仓") if v.store_id else "总仓",
+                  "current_stock": v.current_stock, "safety_stock": v.safety_stock, "status": v.status}
+                 for v in _scope_inventory(db.query(models.Inventory)).filter(
+                     or_(models.Inventory.status == "低于安全库存", models.Inventory.status == "库存不足")).all()]
+
+    return {
+        "negative_stock": negative_stock,
+        "expired_backlog": expired_backlog,
+        "po_logistics_mismatch": po_logistics_mismatch,
+        "low_stock": low_stock,
+        "summary": {
+            "negative_stock": len(negative_stock),
+            "expired_backlog": len(expired_backlog),
+            "po_logistics_mismatch": len(po_logistics_mismatch),
+            "low_stock": len(low_stock),
+        },
+    }
+
+
 @app.get("/api/{entity}")
 def list_items(entity: str, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
@@ -1458,6 +1630,57 @@ def seed():
                              actual_arrival="", status="待发货"),
         ]
         db.add_all(logs); db.commit()
+
+        # 为已签收采购单补充对应的已签收物流（保持数据一致，便于演示供应商对账）
+        log_ok = models.Logistics(code="WL20250701099", supplier_id=suppliers[0].id, warehouse="杭州总仓",
+                                  store_id=stores[0].id, details="茉莉绿茶/锡兰红茶", total_weight="360kg",
+                                  logistics_company="顺丰物流", ship_date="07-05", eta="07-08",
+                                  actual_arrival="07-08", status="已签收")
+        db.add(log_ok); db.flush()
+
+        # 采购单（门店叫货）：覆盖不同供应商/门店/状态，演示供应商对账与数据一致性
+        pos = [
+            models.PurchaseOrder(
+                code="PO2025070001", store_id=stores[0].id, supplier_id=suppliers[0].id,
+                items=json.dumps([
+                    {"i": ings[0].id, "n": "茉莉绿茶", "q": 200, "u": "kg"},
+                    {"i": ings[1].id, "n": "锡兰红茶", "q": 150, "u": "kg"},
+                ]),
+                total_amount=42000.0, status="已签收", approve_note="月度补货",
+                logistics_id=log_ok.id,
+            ),
+            models.PurchaseOrder(
+                code="PO2025070002", store_id=stores[1].id, supplier_id=suppliers[1].id,
+                items=json.dumps([
+                    {"i": ings[5].id, "n": "果葡糖浆", "q": 500, "u": "kg"},
+                ]),
+                total_amount=32500.0, status="已发货", approve_note="旺季备货",
+                logistics_id=logs[1].id,
+            ),
+            models.PurchaseOrder(
+                code="PO2025070003", store_id=stores[0].id, supplier_id=suppliers[2].id,
+                items=json.dumps([
+                    {"i": ings[2].id, "n": "鲜牛奶", "q": 300, "u": "L"},
+                ]),
+                total_amount=18000.0, status="已通过", approve_note="日常补货",
+            ),
+            models.PurchaseOrder(
+                code="PO2025070004", store_id=stores[2].id, supplier_id=suppliers[3].id,
+                items=json.dumps([
+                    {"i": ings[3].id, "n": "黑糖珍珠", "q": 80, "u": "kg"},
+                ]),
+                total_amount=9000.0, status="待审核", approve_note="新店开业备货",
+            ),
+            models.PurchaseOrder(
+                code="PO2025070005", store_id=stores[0].id, supplier_id=suppliers[4].id,
+                items=json.dumps([
+                    {"i": ings[4].id, "n": "芒果果酱", "q": 100, "u": "kg"},
+                ]),
+                total_amount=22000.0, status="已签收", approve_note="促销备货",
+                logistics_id=logs[2].id,
+            ),
+        ]
+        db.add_all(pos); db.commit()
 
         # 同步账号体系：为各层级已有记录创建统一登录账号（演示用，默认已审批转正）
         sync_accounts(db)

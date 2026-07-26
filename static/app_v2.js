@@ -940,10 +940,11 @@ async function renderDashboard() {
   let expAlerts = { total: 0, items: [] };
   let wasStats = { total: 0, total_quantity: 0, total_amount: 0, by_type: {}, by_ingredient: {}, by_store: {} };
   let invAlerts = { total: 0, items: [] };
+  let health = { summary: { negative_stock: 0, expired_backlog: 0, po_logistics_mismatch: 0, low_stock: 0 }, expired_backlog: [], negative_stock: [], low_stock: [], po_logistics_mismatch: [] };
   try {
-    [ings, inv, exp, logs, was, expAlerts, wasStats, invAlerts] = await Promise.all([
+    [ings, inv, exp, logs, was, expAlerts, wasStats, invAlerts, health] = await Promise.all([
       apiGet('ingredients'), apiGet('inventory'), apiGet('expiry'), apiGet('logistics'), apiGet('wastage'),
-      apiGet('expiry/alerts'), apiGet('wastage/stats'), apiGet('inventory/alerts'),
+      apiGet('expiry/alerts'), apiGet('wastage/stats'), apiGet('inventory/alerts'), apiGet('consistency/check'),
     ]);
   } catch (e) { toast(e.message); }
 
@@ -1005,11 +1006,70 @@ async function renderDashboard() {
         ${invRows}
         </tbody></table></div></div>
     </div>
+    <div class="panel"><div class="panel-header"><h3>🩺 数据健康巡检</h3></div>
+      <div class="panel-body">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
+          <div style="flex:1;min-width:120px;padding:12px;border-radius:8px;border:1px solid ${health.summary.negative_stock?'#ffd0d0':'#cfeecf'};background:${health.summary.negative_stock?'#fff5f5':'#f3fff5'};"><div style="font-size:12px;color:var(--text-secondary)">负库存</div><b style="font-size:20px;color:${health.summary.negative_stock?'#d33':'#2a2'}">${health.summary.negative_stock}</b></div>
+          <div style="flex:1;min-width:120px;padding:12px;border-radius:8px;border:1px solid ${health.summary.expired_backlog?'#ffd0d0':'#cfeecf'};background:${health.summary.expired_backlog?'#fff5f5':'#f3fff5'};"><div style="font-size:12px;color:var(--text-secondary)">过期积压</div><b style="font-size:20px;color:${health.summary.expired_backlog?'#d33':'#2a2'}">${health.summary.expired_backlog}</b></div>
+          <div style="flex:1;min-width:120px;padding:12px;border-radius:8px;border:1px solid ${health.summary.po_logistics_mismatch?'#ffd0d0':'#cfeecf'};background:${health.summary.po_logistics_mismatch?'#fff5f5':'#f3fff5'};"><div style="font-size:12px;color:var(--text-secondary)">单据物流不符</div><b style="font-size:20px;color:${health.summary.po_logistics_mismatch?'#d33':'#2a2'}">${health.summary.po_logistics_mismatch}</b></div>
+          <div style="flex:1;min-width:120px;padding:12px;border-radius:8px;border:1px solid ${health.summary.low_stock?'#ffe6c0':'#cfeecf'};background:${health.summary.low_stock?'#fffaf0':'#f3fff5'};"><div style="font-size:12px;color:var(--text-secondary)">低于安全库存</div><b style="font-size:20px;color:${health.summary.low_stock?'#e90':'#2a2'}">${health.summary.low_stock}</b></div>
+        </div>
+        ${(health.expired_backlog||[]).slice(0,6).map(e=>`<div style="font-size:13px;padding:4px 0;color:#d33;">⚠️ ${escapeHtml(e.ingredient_name)}（批次 ${escapeHtml(e.batch_no)}）剩余 ${Number(e.remaining_qty)}，到期 ${escapeHtml(e.expiry_date)}</div>`).join('') || '<div style="font-size:13px;color:#2a2;padding:4px 0;">✅ 无过期积压隐患</div>'}
+      </div></div>
     <div class="panel"><div class="panel-header"><h3>🚚 最近物流动态</h3></div>
       <div class="panel-body"><table><thead><tr><th>物流单号</th><th>供应商</th><th>目的门店</th><th>物料明细</th><th>发货日期</th><th>预计到达</th><th>状态</th></tr></thead><tbody>
       ${logs.items.slice(0, 5).map(r => `<tr><td>${escapeHtml(r.code)}</td><td>${escapeHtml(r.supplier_name)}</td><td>${escapeHtml(r.store_name)}</td><td>${escapeHtml(r.details)}</td><td>${escapeHtml(r.ship_date)}</td><td>${escapeHtml(r.eta)}</td><td>${tag(r.status)}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">暂无物流</td></tr>'}
       </tbody></table></div></div>`;
   document.getElementById('contentArea').innerHTML = html;
+}
+
+/* ============ 供应商对账 ============ */
+async function renderSupplierReconciliation() {
+  let data = { total_suppliers: 0, rows: [] };
+  try {
+    data = await apiGet('suppliers/reconciliation');
+  } catch (e) { toast(e.message); }
+  const rows = data.rows || [];
+  const totalPo = rows.reduce((s, r) => s + (r.po_count || 0), 0);
+  const totalAmt = rows.reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
+  const inTransit = rows.reduce((s, r) => s + (Number(r.in_transit_qty) || 0), 0);
+  const html = `
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-icon blue">🏭</div><div class="stat-info"><h3>${data.total_suppliers}</h3><p>对账供应商数</p></div></div>
+      <div class="stat-card"><div class="stat-icon green">📋</div><div class="stat-info"><h3>${totalPo}</h3><p>采购单总数</p></div></div>
+      <div class="stat-card"><div class="stat-icon orange">💰</div><div class="stat-info"><h3>${fmtMoney(totalAmt)}</h3><p>累计采购金额</p></div></div>
+      <div class="stat-card"><div class="stat-icon red">🚚</div><div class="stat-info"><h3>${inTransit.toFixed(0)}</h3><p>在途数量</p></div></div>
+    </div>
+    <div class="panel"><div class="panel-header"><h3>🧾 供应商对账明细</h3></div>
+      <div class="panel-body"><table><thead><tr><th>供应商</th><th>采购单</th><th>待审核</th><th>已通过</th><th>已发货</th><th>已签收</th><th>累计金额</th><th>已收量</th><th>在途量</th><th>操作</th></tr></thead><tbody>
+      ${rows.map(r => `<tr>
+        <td>${escapeHtml(r.supplier_name)}</td>
+        <td>${r.po_count}</td>
+        <td>${r.by_status['待审核'] || 0}</td>
+        <td>${r.by_status['已通过'] || 0}</td>
+        <td>${r.by_status['已发货'] || 0}</td>
+        <td>${r.by_status['已签收'] || 0}</td>
+        <td>${fmtMoney(r.total_amount)}</td>
+        <td>${Number(r.received_qty).toFixed(0)}</td>
+        <td>${Number(r.in_transit_qty).toFixed(0)}</td>
+        <td><button class="btn btn-sm" onclick="renderSupplierDetail(${r.supplier_id})">明细</button></td>
+      </tr>`).join('') || '<tr><td colspan="10" class="empty">暂无采购数据</td></tr>'}
+      </tbody></table></div></div>
+    <div id="supplierDetail"></div>`;
+  document.getElementById('contentArea').innerHTML = html;
+}
+
+async function renderSupplierDetail(sid) {
+  let d = { supplier: {}, summary: {}, pos: [] };
+  try { d = await apiGet('suppliers/' + sid + '/reconciliation'); } catch (e) { toast(e.message); }
+  const pos = d.pos || [];
+  const box = document.getElementById('supplierDetail');
+  if (!box) return;
+  box.innerHTML = `<div class="panel"><div class="panel-header"><h3>📑 ${escapeHtml(d.supplier.name || '')} 采购单明细</h3></div>
+    <div class="panel-body"><table><thead><tr><th>单号</th><th>门店</th><th>状态</th><th>金额</th><th>数量</th><th>物流状态</th></tr></thead><tbody>
+    ${pos.map(p => `<tr><td>${escapeHtml(p.code)}</td><td>${escapeHtml(p.store_name)}</td><td>${tag(p.status)}</td><td>${fmtMoney(p.total_amount)}</td><td>${Number(p.qty).toFixed(0)}</td><td>${tag(p.logistics_status || '无')}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">无采购单</td></tr>'}
+    </tbody></table></div></div>`;
+  box.scrollIntoView({ behavior: 'smooth' });
 }
 
 /* ============ 系统配置 ============ */
@@ -1284,6 +1344,7 @@ const ROUTERS = {
   pending: renderPending,
   rejected: renderRejected,
   categories: renderCategories,
+  supplier_recon: renderSupplierReconciliation,
 };
 function navigate(page, label) {
   document.getElementById('pageTitle').textContent = label;
