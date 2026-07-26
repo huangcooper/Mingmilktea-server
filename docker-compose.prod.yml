@@ -1,0 +1,44 @@
+# ==============================================================
+# 生产环境部署编排 — 物理机 100.114.225.7
+# 启动: docker compose -f docker-compose.prod.yml up -d
+# 查看: docker compose -f docker-compose.prod.yml ps
+# 日志: docker compose -f docker-compose.prod.yml logs -f app
+# ==============================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: milktea-db
+    environment:
+      POSTGRES_DB: milktea
+      POSTGRES_USER: milktea
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-milktea}
+    volumes:
+      - /srv/data/milktea/pgdata:/var/lib/postgresql/data
+    networks:
+      - milktea-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U milktea -d milktea"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: rt-milktea
+    environment:
+      DATABASE_URL: postgresql://milktea:${DB_PASSWORD:-milktea}@db:5432/milktea
+    networks:
+      - milktea-net
+      - remote-test_default  # 复用现有 caddy 代理网络
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+
+networks:
+  milktea-net:
+    driver: bridge
+  remote-test_default:
+    external: true

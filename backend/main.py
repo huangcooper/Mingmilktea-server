@@ -20,16 +20,19 @@ from urllib.parse import quote
 import openpyxl
 
 from db import engine, Base, get_db
+from config import DATABASE_URL, IS_SQLITE
 import models
 
 # 启动时创建表
 Base.metadata.create_all(bind=engine)
+print(f"[DB] 数据库引擎: {'SQLite' if IS_SQLITE else 'PostgreSQL'} — {DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL}")
 
 
 def migrate():
-    """为新版配料模型补齐缺失列（幂等，兼容旧库）"""
+    """为新版配料模型补齐缺失列（幂等，兼容旧库 SQLite/PostgreSQL）"""
     inspector = inspect(engine)
     existing = {c["name"] for c in inspector.get_columns("ingredients")}
+    bool_default = "BOOLEAN DEFAULT 0" if IS_SQLITE else "BOOLEAN DEFAULT FALSE"
     new_cols = {
         "barcode": "VARCHAR(64)",
         "sale_price": "FLOAT",
@@ -39,14 +42,14 @@ def migrate():
         "shelf_life": "VARCHAR(32)",
         "pinyin": "VARCHAR(64)",
         "remark": "VARCHAR(256)",
-        "not_count_stock": "BOOLEAN DEFAULT 0",
-        "multi_code": "BOOLEAN DEFAULT 0",
-        "use_member_discount": "BOOLEAN DEFAULT 0",
-        "has_other_spec": "BOOLEAN DEFAULT 0",
-        "label_print": "BOOLEAN DEFAULT 0",
-        "refrigerated": "BOOLEAN DEFAULT 0",
-        "unopened": "BOOLEAN DEFAULT 0",
-        "kitchen_ticket": "BOOLEAN DEFAULT 0",
+        "not_count_stock": bool_default,
+        "multi_code": bool_default,
+        "use_member_discount": bool_default,
+        "has_other_spec": bool_default,
+        "label_print": bool_default,
+        "refrigerated": bool_default,
+        "unopened": bool_default,
+        "kitchen_ticket": bool_default,
         "wholesale_price": "FLOAT DEFAULT 0",
         "prep_time": "FLOAT DEFAULT 0",
         "weight": "FLOAT DEFAULT 0",
@@ -63,7 +66,11 @@ def migrate():
         acct_cols = {c["name"] for c in inspector.get_columns("accounts")}
         if "must_change_password" not in acct_cols:
             with engine.begin() as conn2:
-                conn2.execute(text("ALTER TABLE accounts ADD COLUMN must_change_password BOOLEAN DEFAULT 0"))
+                conn2.execute(text(
+                    "ALTER TABLE accounts ADD COLUMN must_change_password BOOLEAN DEFAULT 0"
+                    if IS_SQLITE else
+                    "ALTER TABLE accounts ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE"
+                ))
     except Exception as e:
         print("[migrate] accounts.must_change_password 迁移失败:", e)
     with engine.begin() as conn:

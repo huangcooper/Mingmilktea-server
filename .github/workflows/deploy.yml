@@ -1,0 +1,84 @@
+# ==============================================================
+# 奶茶原材料管理系统 — CI/CD 自动部署流水线
+# 触发：push 到 main 分支
+# 流程：checkout → Tailscale 联网 → SSH 部署 → Docker 重建
+#
+# 前置准备（GitHub 仓库 Settings → Secrets and variables → Actions）：
+#   1. SSH_PRIVATE_KEY: 物理机 root 的 SSH 私钥
+#   2. TAILSCALE_AUTHKEY: Tailscale 预授权密钥（一次性，可复用）
+#      获取：https://login.tailscale.com/admin/settings/keys
+# ==============================================================
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 连接 Tailscale 网络
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID || '' }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET || '' }}
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+        continue-on-error: true
+
+      - name: 部署到物理机
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            echo "=== [$(date)] 开始部署 奶茶系统 ==="
+
+            cd /srv/remote-test/apps/milktea
+
+            # 1. 拉取最新代码
+            git pull origin main
+
+            # 2. 构建新镜像
+            echo "构建 Docker 镜像..."
+            docker build -t remote-test-milktea:latest .
+
+            # 3. 停旧容器
+            if docker ps -a --format '{{.Names}}' | grep -q '^rt-milktea$'; then
+              echo "停止旧容器..."
+              docker stop rt-milktea || true
+              docker rm rt-milktea || true
+            fi
+
+            # 4. 启动新容器
+            echo "启动新容器..."
+            docker run -d \
+              --name rt-milktea \
+              --network remote-test_default \
+              --network-alias milktea \
+              --restart unless-stopped \
+              -e DATABASE_URL="${DATABASE_URL:-sqlite:///./milk_tea.db}" \
+              remote-test-milktea:latest
+
+            # 5. 验证
+            sleep 3
+            STATUS=$(docker inspect -f '{{.State.Status}}' rt-milktea 2>/dev/null || echo "missing")
+            echo "容器状态: $STATUS"
+
+            if [ "$STATUS" != "running" ]; then
+              echo "⚠️ 容器未正常运行，最近日志："
+              docker logs --tail 20 rt-milktea
+              exit 1
+            fi
+
+            echo "=== [$(date)] 部署完成 ==="
