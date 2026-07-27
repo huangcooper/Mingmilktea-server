@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, or_, String, Integer, Float, text, inspect
+from sqlalchemy import and_, or_, func, String, Integer, Float, text, inspect
 from sqlalchemy.orm import Session
 from urllib.parse import quote
 import openpyxl
@@ -180,6 +180,12 @@ MODEL_REGISTRY = {
     "categories": models.Category,
     "units": models.Unit,
     "purchase_orders": models.PurchaseOrder,
+    # Phase 6 — 供应链生态闭环
+    "factories": models.Factory,
+    "devices": models.Device,
+    "consumption": models.Consumption,
+    "recipes": models.Recipe,
+    "replenish_rules": models.ReplenishRule,
 }
 
 # 组织层级：每个实体对其直接下级设置数量配额，由上级授权
@@ -446,7 +452,35 @@ def filter_by_visibility(q, entity, visible_ids, db):
             filters.append(models.Inventory.store_id == None)
         if filters:
             return q.filter(or_(*filters))
-    # categories, units, platforms: 不做隔离（字典/基础设施）
+    # Phase 6 — 供应链闭环可见性
+    if entity == "factories":
+        # 工厂按 platform_id 过滤，或按下游供应商所属 platform 过滤
+        return q  # factories 对平台全可见，下级按需过滤
+    if entity == "devices":
+        store_ids = visible_ids.get("stores", [])
+        if store_ids:
+            return q.filter(models.Device.store_id.in_(store_ids))
+    if entity == "consumption":
+        store_ids = visible_ids.get("stores", [])
+        ing_ids = _visible_ingredient_ids(visible_ids, db)
+        filters = []
+        if store_ids:
+            filters.append(models.Consumption.store_id.in_(store_ids))
+        if ing_ids:
+            filters.append(models.Consumption.ingredient_id.in_(ing_ids))
+        if filters:
+            return q.filter(or_(*filters))
+    if entity == "replenish_rules":
+        store_ids = visible_ids.get("stores", [])
+        ing_ids = _visible_ingredient_ids(visible_ids, db)
+        filters = []
+        if store_ids:
+            filters.append(or_(models.ReplenishRule.store_id.in_(store_ids), models.ReplenishRule.store_id == None))
+        if ing_ids:
+            filters.append(models.ReplenishRule.ingredient_id.in_(ing_ids))
+        if filters:
+            return q.filter(and_(*filters))
+    # recipes, categories, units, platforms: 不做隔离（字典/基础设施）
     return q
 
 
@@ -470,8 +504,13 @@ NAME_JOINS = {
     "wastage": [("store_id", "stores", "store_name"), ("ingredient_id", "ingredients", "ingredient_name")],
     "prep": [("store_id", "stores", "store_name")],
     "expiry": [("ingredient_id", "ingredients", "ingredient_name")],
-    "logistics": [("supplier_id", "suppliers", "supplier_name"), ("store_id", "stores", "store_name")],
+    "logistics": [("supplier_id", "suppliers", "supplier_name"), ("store_id", "stores", "store_name"), ("factory_id", "factories", "factory_name")],
     "purchase_orders": [("store_id", "stores", "store_name"), ("supplier_id", "suppliers", "supplier_name")],
+    # Phase 6 — 供应链闭环外键关联
+    "factories": [("platform_id", "platforms", "platform_name")],
+    "devices": [("store_id", "stores", "store_name")],
+    "consumption": [("device_id", "devices", "device_name"), ("store_id", "stores", "store_name"), ("ingredient_id", "ingredients", "ingredient_name"), ("recipe_id", "recipes", "recipe_name")],
+    "replenish_rules": [("ingredient_id", "ingredients", "ingredient_name"), ("store_id", "stores", "store_name"), ("supplier_id", "suppliers", "supplier_name")],
 }
 
 
@@ -887,7 +926,240 @@ def list_audit_logs(request: Request, db: Session = Depends(get_db),
     return {"total": total, "items": [r.to_dict() for r in rows]}
 
 
-@app.get("/api/{entity}")
+# ============================================================
+# Phase 6 — 茶饮供应链生态闭环 API
+# ============================================================
+
+@app.post("/api/devices/heartbeat")
+def device_heartbeat(payload: dict, db: Session = Depends(get_db)):
+    """设备心跳上报：奶茶机/收银机定期发送，更新在线状态"""
+    mac = payload.get("mac") or payload.get("code")
+    if not mac:
+        raise HTTPException(status_code=400, detail="缺少 MAC 地址或设备编号")
+    device = db.query(models.Device).filter(
+        (models.Device.mac == mac) | (models.Device.code == mac)
+    ).first()
+    if not device:
+        # 自动注册新设备
+        device = models.Device(
+            code=mac.replace(":", "").replace("-", ""),
+            mac=mac,
+            name=payload.get("name", f"设备-{mac[-6:]}"),
+            type=payload.get("type", "奶茶机"),
+            model=payload.get("model", ""),
+            firmware=payload.get("firmware", ""),
+            ip_address=payload.get("ip", ""),
+            store_id=payload.get("store_id", 0),
+            api_key=secrets.token_hex(16),
+            online=True,
+            last_heartbeat=_now_str(),
+            status="正常",
+        )
+        db.add(device)
+        db.commit()
+        db.refresh(device)
+    else:
+        device.online = True
+        device.last_heartbeat = _now_str()
+        if payload.get("ip"):
+            device.ip_address = payload["ip"]
+        if payload.get("firmware"):
+            device.firmware = payload["firmware"]
+        db.commit()
+    return {"status": "ok", "device_id": device.id, "api_key": device.api_key}
+
+
+@app.post("/api/consumption/report")
+def report_consumption(payload: dict, db: Session = Depends(get_db)):
+    """设备消耗上报：奶茶机/收银机上报原料消耗，自动扣库存
+    请求格式: {"device_mac": "aa:bb:cc:dd", "records": [{"ingredient_code": "PL-001", "qty": 0.5, "batch": "BT01", "time": "..."}]}
+    """
+    mac = payload.get("device_mac") or payload.get("mac")
+    records = payload.get("records", [])
+    if not mac or not records:
+        raise HTTPException(status_code=400, detail="缺少 device_mac 或 records")
+
+    device = db.query(models.Device).filter(models.Device.mac == mac).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="未注册设备")
+
+    results = []
+    for rec in records:
+        ing_code = rec.get("ingredient_code") or rec.get("code")
+        qty = float(rec.get("qty", 0))
+        if not ing_code or qty <= 0:
+            continue
+
+        ing = db.query(models.Ingredient).filter(models.Ingredient.code == ing_code).first()
+        if not ing:
+            results.append({"code": ing_code, "status": "fail", "msg": "配料不存在"})
+            continue
+
+        # 生成消耗记录
+        now = _now_str()
+        cons = models.Consumption(
+            code=f"CS{device.mac.replace(':', '')[-6:]}{now.replace('-', '').replace(':', '').replace(' ', '')}",
+            device_id=device.id,
+            store_id=device.store_id or 0,
+            ingredient_id=ing.id,
+            quantity=qty,
+            unit=rec.get("unit", ing.unit or ""),
+            batch_no=rec.get("batch", ""),
+            consume_time=rec.get("time", now),
+            source="设备上报",
+            status="已确认",
+        )
+        db.add(cons)
+
+        # 自动扣库存：优先扣门店库存
+        inv = db.query(models.Inventory).filter(
+            models.Inventory.ingredient_id == ing.id,
+            models.Inventory.store_id == device.store_id,
+        ).first()
+        if not inv:
+            inv = db.query(models.Inventory).filter(
+                models.Inventory.ingredient_id == ing.id,
+                models.Inventory.store_id == None,
+            ).first()
+        if inv:
+            inv.current_stock = max(0.0, (inv.current_stock or 0) - qty)
+            inv.last_out = now
+            s = inv.safety_stock or 0
+            if inv.current_stock <= 0:
+                inv.status = "库存不足"
+            elif inv.current_stock < s:
+                inv.status = "低于安全库存"
+            else:
+                inv.status = "正常"
+
+        results.append({"code": ing_code, "status": "ok", "qty": qty, "new_stock": inv.current_stock if inv else None})
+
+    db.commit()
+    return {"status": "ok", "count": len(results), "records": results}
+
+
+@app.get("/api/consumption/stats")
+def consumption_stats(request: Request, db: Session = Depends(get_db),
+                      from_date: str = None, to_date: str = None,
+                      store_id: int = None, device_id: int = None):
+    """消耗统计：按配料/门店/设备/时间段汇总"""
+    q = db.query(
+        models.Consumption.ingredient_id,
+        models.Ingredient.name.label("ingredient_name"),
+        models.Ingredient.unit,
+        func.sum(models.Consumption.quantity).label("total_qty"),
+        func.count(models.Consumption.id).label("record_count"),
+    ).join(models.Ingredient, models.Consumption.ingredient_id == models.Ingredient.id)
+
+    if from_date:
+        q = q.filter(models.Consumption.consume_time >= from_date)
+    if to_date:
+        q = q.filter(models.Consumption.consume_time <= to_date)
+    if store_id:
+        q = q.filter(models.Consumption.store_id == store_id)
+    if device_id:
+        q = q.filter(models.Consumption.device_id == device_id)
+
+    rows = q.group_by(models.Consumption.ingredient_id, models.Ingredient.name, models.Ingredient.unit).order_by(func.sum(models.Consumption.quantity).desc()).all()
+
+    daily = db.query(
+        func.substr(models.Consumption.consume_time, 1, 10).label("date"),
+        func.sum(models.Consumption.quantity).label("total"),
+    )
+    if store_id:
+        daily = daily.filter(models.Consumption.store_id == store_id)
+    daily = daily.group_by(func.substr(models.Consumption.consume_time, 1, 10)).order_by("date").limit(30).all()
+
+    return {
+        "by_ingredient": [{"ingredient_id": r[0], "ingredient_name": r[1], "unit": r[2], "total_qty": float(r[3] or 0), "record_count": r[4]} for r in rows],
+        "daily_trend": [{"date": r[0], "total": float(r[1] or 0)} for r in daily],
+    }
+
+
+@app.post("/api/replenish/check")
+def check_replenish(db: Session = Depends(get_db)):
+    """扫描所有启用的补货规则，检查是否触发补货，返回建议叫货清单"""
+    rules = db.query(models.ReplenishRule).filter(models.ReplenishRule.status == "启用").all()
+    suggestions = []
+    for rule in rules:
+        inv = db.query(models.Inventory).filter(
+            models.Inventory.ingredient_id == rule.ingredient_id,
+            models.Inventory.store_id == rule.store_id,
+        ).first()
+        if not inv:
+            continue
+        stock = inv.current_stock or 0
+        if stock <= rule.reorder_point:
+            # 计算建议天数用量覆盖
+            daily = rule.avg_daily_usage or 0
+            if daily > 0:
+                days_left = stock / daily if daily > 0 else 999
+                suggested = max(rule.reorder_qty, daily * rule.lead_time_days - stock + rule.safety_stock)
+            else:
+                days_left = 999
+                suggested = rule.reorder_qty
+
+            ing = db.query(models.Ingredient).filter(models.Ingredient.id == rule.ingredient_id).first()
+            suggestions.append({
+                "rule_id": rule.id,
+                "ingredient_id": rule.ingredient_id,
+                "ingredient_name": ing.name if ing else "",
+                "current_stock": stock,
+                "safety_stock": rule.safety_stock,
+                "reorder_point": rule.reorder_point,
+                "daily_usage": round(daily, 2),
+                "days_left": round(days_left, 1),
+                "suggested_qty": round(suggested, 1),
+                "supplier_id": rule.supplier_id,
+                "lead_time_days": rule.lead_time_days,
+                "auto_approve": rule.auto_approve,
+            })
+    return {"count": len(suggestions), "suggestions": suggestions}
+
+
+@app.post("/api/replenish/generate-po")
+def generate_auto_po(db: Session = Depends(get_db)):
+    """根据补货建议自动生成叫货单（仅处理 auto_approve=True 的规则）"""
+    result = check_replenish(db)
+    created = []
+    by_store_supplier = {}
+    for s in result["suggestions"]:
+        if not s.get("auto_approve"):
+            continue
+        key = (s["store_id"] or 0, s["supplier_id"])
+        if key not in by_store_supplier:
+            by_store_supplier[key] = []
+        by_store_supplier[key].append(s)
+
+    for (store_id, supplier_id), items in by_store_supplier.items():
+        code = f"PO-{_now_str()[:10]}-{store_id}{supplier_id}"
+        items_json = json.dumps([{"i": it["ingredient_id"], "n": it["ingredient_name"], "q": it["suggested_qty"]} for it in items])
+        po = models.PurchaseOrder(
+            code=code, store_id=store_id, supplier_id=supplier_id,
+            items=items_json, total_amount=0, status="待审核",
+        )
+        db.add(po)
+        created.append(code)
+    db.commit()
+    return {"status": "ok", "created": len(created), "po_codes": created}
+
+
+@app.get("/api/devices/online")
+def devices_online_status(db: Session = Depends(get_db)):
+    """设备在线状态概览"""
+    total = db.query(models.Device).count()
+    online_count = db.query(models.Device).filter(models.Device.online == True).count()
+    by_type = {}
+    for d in db.query(models.Device).all():
+        t = d.type or "未分类"
+        if t not in by_type:
+            by_type[t] = {"total": 0, "online": 0}
+        by_type[t]["total"] += 1
+        if d.online:
+            by_type[t]["online"] += 1
+    offline_devices = [{"id": d.id, "name": d.name, "mac": d.mac, "last_heartbeat": d.last_heartbeat}
+                       for d in db.query(models.Device).filter(models.Device.online == False).limit(10).all()]
+    return {"total": total, "online": online_count, "by_type": by_type, "offline": offline_devices}
 def list_items(entity: str, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
     params = dict(request.query_params)
@@ -1247,6 +1519,11 @@ APPLY_EXCLUDE = {"username", "password", "account_status", "registered_at", "cod
 def _today():
     from datetime import datetime as _dt
     return _dt.now().strftime("%Y-%m-%d")
+
+
+def _now_str():
+    from datetime import datetime as _dt
+    return _dt.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 @app.post("/auth/register")
@@ -1799,6 +2076,148 @@ def seed():
             ),
         ]
         db.add_all(pos); db.commit()
+
+        # Phase 6 — 工厂
+        factories = [
+            models.Factory(code="FC-001", name="安溪高山茶园", type="茶农", platform_id=1,
+                           region="福建安溪", contact="王大山", phone="0595-8880001",
+                           annual_capacity="300吨", certifications="有机认证,ISO22000", quality_rating=95,
+                           cooperation_start="2020-03-01", status="合作中",
+                           username="anshitea", password=hash_password("123456"), account_status="正常", registered_at="2020-03-01"),
+            models.Factory(code="FC-002", name="云南普洱生态基地", type="茶农", platform_id=1,
+                           region="云南普洱", contact="李茶叶", phone="0879-6660002",
+                           annual_capacity="500吨", certifications="HACCP,绿色食品", quality_rating=92,
+                           cooperation_start="2019-06-15", status="合作中",
+                           username="puertea", password=hash_password("123456"), account_status="正常", registered_at="2019-06-15"),
+            models.Factory(code="FC-003", name="广西甜蜜蜜糖业", type="糖厂", platform_id=1,
+                           region="广西南宁", contact="张糖业", phone="0771-5550003",
+                           annual_capacity="1000吨", certifications="ISO9001", quality_rating=88,
+                           cooperation_start="2021-01-10", status="合作中",
+                           username="tianmiplant", password=hash_password("123456"), account_status="正常", registered_at="2021-01-10"),
+            models.Factory(code="FC-004", name="呼伦贝尔奶源牧场", type="奶源基地", platform_id=1,
+                           region="内蒙古呼伦贝尔", contact="赵牧场", phone="0470-3330004",
+                           annual_capacity="800吨", certifications="有机认证,ISO22000", quality_rating=96,
+                           cooperation_start="2018-05-20", status="合作中",
+                           username="hulunmilk", password=hash_password("123456"), account_status="正常", registered_at="2018-05-20"),
+        ]
+        db.add_all(factories); db.commit()
+        for f in factories: db.refresh(f)
+
+        # Phase 6 — 门店设备
+        from datetime import datetime as _dt
+        now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        devices = [
+            models.Device(code="MZ-001", name="鸣智奶茶机-1号", store_id=stores[0].id,
+                          mac="AA:BB:CC:DD:01:01", type="奶茶机", model="MZ-2000",
+                          api_key=secrets.token_hex(16), firmware="v2.3.1",
+                          last_heartbeat=now_str, online=True, ip_address="192.168.1.101", status="正常"),
+            models.Device(code="MZ-002", name="鸣智奶茶机-2号", store_id=stores[0].id,
+                          mac="AA:BB:CC:DD:01:02", type="奶茶机", model="MZ-2000",
+                          api_key=secrets.token_hex(16), firmware="v2.3.1",
+                          last_heartbeat=now_str, online=True, ip_address="192.168.1.102", status="正常"),
+            models.Device(code="MZ-003", name="鸣智奶茶机-海淀1号", store_id=stores[1].id,
+                          mac="AA:BB:CC:DD:02:01", type="奶茶机", model="MZ-2000",
+                          api_key=secrets.token_hex(16), firmware="v2.2.8",
+                          last_heartbeat=_dt.now().strftime("%Y-%m-%d %H:%M:%S"), online=True, ip_address="192.168.2.101", status="正常"),
+            models.Device(code="POS-001", name="收银POS-朝阳店", store_id=stores[0].id,
+                          mac="AA:BB:CC:DD:01:03", type="收银机", model="POS-X500",
+                          api_key=secrets.token_hex(16), firmware="v1.5.0",
+                          last_heartbeat=now_str, online=True, ip_address="192.168.1.201", status="正常"),
+            models.Device(code="MZ-004", name="鸣智奶茶机-金融街1号", store_id=stores[2].id,
+                          mac="AA:BB:CC:DD:03:01", type="奶茶机", model="MZ-2000",
+                          api_key=secrets.token_hex(16), firmware="v2.3.0",
+                          last_heartbeat=_dt.now().strftime("%Y-%m-%d %H:%M:%S"), online=False, ip_address="", status="离线"),
+        ]
+        db.add_all(devices); db.commit()
+
+        # Phase 6 — 饮品配方
+        recipes = [
+            models.Recipe(code="RC-001", name="经典珍珠奶茶", version="2.1", category="奶茶", cup_size="中杯500ml",
+                          materials=json.dumps([
+                              {"i": ings[0].id, "n": "茉莉绿茶", "q": 5, "u": "g"},
+                              {"i": ings[5].id, "n": "果葡糖浆", "q": 30, "u": "ml"},
+                              {"i": ings[2].id, "n": "鲜牛奶", "q": 80, "u": "ml"},
+                              {"i": ings[3].id, "n": "黑糖珍珠", "q": 50, "u": "g"},
+                          ]),
+                          cost_per_cup=3.6, sale_price_ref=16.0,
+                          steps=json.dumps(["煮茶5min", "加糖浆", "加牛奶", "加珍珠", "摇匀"]),
+                          developer="王芳", status="已定型"),
+            models.Recipe(code="RC-002", name="杨枝甘露", version="3.0", category="果茶", cup_size="大杯700ml",
+                          materials=json.dumps([
+                              {"i": ings[4].id, "n": "芒果果酱", "q": 60, "u": "g"},
+                              {"i": ings[2].id, "n": "鲜牛奶", "q": 60, "u": "ml"},
+                              {"i": ings[5].id, "n": "果葡糖浆", "q": 20, "u": "ml"},
+                          ]),
+                          cost_per_cup=4.8, sale_price_ref=22.0,
+                          steps=json.dumps(["芒果打底", "加椰浆", "加牛奶", "加糖浆", "搅匀"]),
+                          developer="李红", status="已定型"),
+            models.Recipe(code="RC-003", name="金凤茶王", version="1.2", category="奶茶", cup_size="中杯500ml",
+                          materials=json.dumps([
+                              {"i": ings[1].id, "n": "锡兰红茶", "q": 6, "u": "g"},
+                              {"i": ings[5].id, "n": "果葡糖浆", "q": 25, "u": "ml"},
+                              {"i": ings[2].id, "n": "鲜牛奶", "q": 100, "u": "ml"},
+                          ]),
+                          cost_per_cup=4.2, sale_price_ref=18.0,
+                          steps=json.dumps(["泡红茶5min", "加糖浆", "加牛奶", "拉茶"]),
+                          developer="王芳", status="已定型"),
+        ]
+        db.add_all(recipes); db.commit()
+        for r in recipes: db.refresh(r)
+
+        # Phase 6 — 消耗记录（模拟设备上报）
+        from datetime import timedelta
+        import random
+        base_date = _dt.now()
+        for day_offset in range(7, 0, -1):
+            d = base_date - timedelta(days=day_offset)
+            dt = d.strftime("%Y-%m-%d %H:%M:%S")
+            # 奶茶机每天消耗茉莉绿茶
+            db.add(models.Consumption(
+                code=f"CS{devices[0].mac.replace(':', '')[-6:]}{d.strftime('%Y%m%d')}01",
+                device_id=devices[0].id, store_id=stores[0].id, ingredient_id=ings[0].id,
+                quantity=round(random.uniform(3.0, 8.0), 2), unit="kg",
+                batch_no="BT20250510", consume_time=dt, source="设备上报", status="已确认",
+            ))
+            # 消耗珍珠
+            db.add(models.Consumption(
+                code=f"CS{devices[0].mac.replace(':', '')[-6:]}{d.strftime('%Y%m%d')}02",
+                device_id=devices[0].id, store_id=stores[0].id, ingredient_id=ings[3].id,
+                quantity=round(random.uniform(1.5, 4.0), 2), unit="kg",
+                batch_no="BT20250312", consume_time=dt, source="设备上报", status="已确认",
+            ))
+            # 海淀店消耗
+            db.add(models.Consumption(
+                code=f"CS{devices[2].mac.replace(':', '')[-6:]}{d.strftime('%Y%m%d')}01",
+                device_id=devices[2].id, store_id=stores[1].id, ingredient_id=ings[1].id,
+                quantity=round(random.uniform(2.0, 5.0), 2), unit="kg",
+                batch_no="BT20250401", consume_time=dt, source="设备上报", status="已确认",
+            ))
+        db.commit()
+
+        # Phase 6 — 补货规则
+        rules = [
+            models.ReplenishRule(code="RR-001", ingredient_id=ings[0].id, store_id=stores[0].id,
+                                 safety_stock=200, reorder_point=150, reorder_qty=100,
+                                 supplier_id=suppliers[0].id, lead_time_days=3,
+                                 avg_daily_usage=5.5, auto_approve=True, status="启用",
+                                 last_calc_time=now_str),
+            models.ReplenishRule(code="RR-002", ingredient_id=ings[2].id, store_id=None,
+                                 safety_stock=300, reorder_point=200, reorder_qty=150,
+                                 supplier_id=suppliers[2].id, lead_time_days=2,
+                                 avg_daily_usage=120.0, auto_approve=False, status="启用",
+                                 last_calc_time=now_str),
+            models.ReplenishRule(code="RR-003", ingredient_id=ings[3].id, store_id=stores[0].id,
+                                 safety_stock=80, reorder_point=50, reorder_qty=40,
+                                 supplier_id=suppliers[3].id, lead_time_days=5,
+                                 avg_daily_usage=2.8, auto_approve=True, status="启用",
+                                 last_calc_time=now_str),
+            models.ReplenishRule(code="RR-004", ingredient_id=ings[5].id, store_id=None,
+                                 safety_stock=500, reorder_point=300, reorder_qty=250,
+                                 supplier_id=suppliers[1].id, lead_time_days=4,
+                                 avg_daily_usage=280.0, auto_approve=False, status="启用",
+                                 last_calc_time=now_str),
+        ]
+        db.add_all(rules); db.commit()
 
         # 同步账号体系：为各层级已有记录创建统一登录账号（演示用，默认已审批转正）
         sync_accounts(db)

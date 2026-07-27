@@ -181,6 +181,63 @@ const ENTITY_CONFIG = {
       'items:叫货明细:poitems', 'total_amount:总金额:number', 'status:状态:select:待审核,已拒绝,已通过,已发货,已签收',
       'approve_note:审批备注'],
   },
+
+  // Phase 6 — 供应链生态闭环
+  factories: {
+    title: '🏭 原料工厂',
+    columns: ['code:工厂编号', 'name:工厂名称', 'type:类型:tag', 'region:产地', 'annual_capacity:产能',
+      'quality_rating:质量评分', 'certifications:资质', 'status:状态:tag'],
+    form: ['code:工厂编号', 'name:工厂名称', 'platform_id:所属平台:fk:platforms',
+      'type:类型:select:茶农,糖厂,奶源基地,种植基地,加工厂',
+      'region:产地', 'contact:联系人', 'phone:电话',
+      'annual_capacity:年产能', 'certifications:资质认证', 'quality_rating:质量评分(0-100):number',
+      'cooperation_start:合作起始日', 'status:状态:select:合作中,暂停,停用',
+      'username:登录账号', 'password:密码:password'],
+    filters: ['type:类型:茶农,糖厂,奶源基地,种植基地,加工厂'],
+  },
+  devices: {
+    title: '🖥️ 门店设备',
+    columns: ['code:设备编号', 'name:设备名称', 'store_name:所属门店', 'mac:MAC地址', 'type:类型:tag',
+      'model:型号', 'online:在线:switch:在线,离线', 'ip_address:IP地址', 'status:状态:tag'],
+    form: ['code:设备编号', 'name:设备名称', 'store_id:所属门店:fk:stores', 'mac:MAC地址',
+      'type:类型:select:奶茶机,收银机,POS,标签秤', 'model:型号',
+      'firmware:固件版本', 'status:状态:select:正常,离线,故障,维护'],
+  },
+  consumption: {
+    title: '📉 原料消耗',
+    columns: ['code:记录编号', 'device_name:设备', 'store_name:门店', 'ingredient_name:配料',
+      'quantity:用量', 'unit:单位', 'batch_no:批号', 'consume_time:时间',
+      'source:来源:tag', 'status:状态:tag'],
+    form: ['code:记录编号', 'device_id:设备:fk:devices', 'store_id:门店:fk:stores',
+      'ingredient_id:配料:fk:ingredients', 'quantity:用量:number', 'unit:单位',
+      'batch_no:批号', 'consume_time:消耗时间', 'source:来源:select:设备上报,手动录入,配方消耗',
+      'status:状态:select:待确认,已确认,已冲正'],
+    filters: ['source:来源:设备上报,手动录入,配方消耗', 'store_id:门店:fk:stores'],
+  },
+  recipes: {
+    title: '🧋 饮品配方',
+    columns: ['code:配方编号', 'name:配方名称', 'version:版本', 'category:品类:tag',
+      'cup_size:杯型', 'cost_per_cup:单杯成本:money', 'sale_price_ref:建议售价:money',
+      'developer:研发人', 'status:状态:tag'],
+    form: ['code:配方编号', 'name:配方名称', 'version:版本号',
+      'category:品类:select:奶茶,果茶,咖啡,冰沙,纯茶', 'cup_size:杯型规格',
+      'materials:配料清单', 'cost_per_cup:单杯成本:number', 'sale_price_ref:建议售价:number',
+      'steps:制作步骤', 'developer:研发人', 'status:状态:select:研发中,已定型,已停用',
+      'remark:备注'],
+    filters: ['category:品类:奶茶,果茶,咖啡,冰沙,纯茶'],
+  },
+  replenish_rules: {
+    title: '📦 智能补货',
+    columns: ['code:规则编号', 'ingredient_name:配料', 'store_name:门店',
+      'safety_stock:安全库存', 'reorder_point:订货点', 'reorder_qty:建议量',
+      'avg_daily_usage:日均用量', 'lead_time_days:提前期(天)', 'auto_approve:自动审批:switch:是,否',
+      'status:状态:tag'],
+    form: ['code:规则编号', 'ingredient_id:配料:fk:ingredients', 'store_id:门店(留空=总仓):fk:stores',
+      'safety_stock:安全库存:number', 'reorder_point:订货点:number', 'reorder_qty:建议补货量:number',
+      'supplier_id:供应商:fk:suppliers', 'lead_time_days:提前期(天):number',
+      'auto_approve:自动审批:switch:是,否', 'status:状态:select:启用,停用'],
+    filters: ['auto_approve:自动审批:是,否'],
+  },
 };
 
 // 解析列/表单字段定义串
@@ -1073,6 +1130,96 @@ async function renderSupplierDetail(sid) {
   box.scrollIntoView({ behavior: 'smooth' });
 }
 
+/* ============ Phase 6 — 供应链生态看板 ============ */
+async function renderSupplyChain() {
+  let compras = { by_ingredient: [], daily_trend: [] };
+  let deviceStatus = { total: 0, online: 0, by_type: {}, offline: [] };
+  let rules = { suggestions: [], count: 0 };
+  try {
+    [compras, deviceStatus, rules] = await Promise.all([
+      apiGet('consumption/stats'),
+      apiGet('devices/online'),
+      apiGet('replenish/check', { method: 'POST' }),
+    ]);
+  } catch (e) { /* 放行 */ }
+
+  const dc = deviceStatus;
+  const trendData = (compras.daily_trend || []).slice(-14);
+  const maxQty = Math.max(1, ...trendData.map(d => d.total));
+
+  let html = `<div class="stats-row">
+    <div class="stat-card"><div class="stat-num">${dc.total}</div><div class="stat-label">设备总数</div></div>
+    <div class="stat-card"><div class="stat-num" style="color:#00b894">${dc.online}</div><div class="stat-label">在线设备</div></div>
+    <div class="stat-card"><div class="stat-num" style="color:#e17055">${dc.total - dc.online}</div><div class="stat-label">离线设备</div></div>
+    <div class="stat-card"><div class="stat-num" style="color:#fdcb6e">${rules.count}</div><div class="stat-label">待补货</div></div>
+  </div>`;
+
+  html += `<div class="grid-2"><div class="panel"><div class="panel-header"><h3>📊 近14天原料消耗趋势</h3></div><div class="panel-body">
+    <div style="display:flex;align-items:flex-end;gap:4px;height:120px;padding:8px 0;">`;
+  for (const d of trendData) {
+    const h = Math.max(4, (d.total / maxQty) * 110);
+    html += `<div style="flex:1;display:flex;flex-direction:column;align-items:center;">
+      <span style="font-size:10px;color:#636e72;">${Number(d.total).toFixed(1)}</span>
+      <div style="width:100%;background:${maxQty&&d.total/maxQty>0.7?'#e17055':'#74b9ff'};height:${h}px;border-radius:3px 3px 0 0;min-width:12px;"></div>
+      <span style="font-size:9px;color:#b2bec3;margin-top:4px;writing-mode:vertical-rl;">${(d.date||'').slice(5)}</span></div>`;
+  }
+  html += `</div></div></div>`;
+
+  html += `<div class="panel"><div class="panel-header"><h3>🖥️ 设备在线状态</h3></div><div class="panel-body">
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;">`;
+  for (const [t, v] of Object.entries(dc.by_type || {})) {
+    html += `<div style="padding:8px 16px;background:#f8f9fa;border-radius:8px;text-align:center;">
+      <div style="font-size:20px;">${t==='奶茶机'?'🫖':t==='收银机'?'🧾':'📟'}</div>
+      <div style="font-size:11px;color:#636e72;">${t}</div>
+      <div style="font-size:18px;font-weight:500;">${v.online}/${v.total}</div></div>`;
+  }
+  html += `</div>`;
+  if (dc.offline && dc.offline.length) {
+    html += `<div style="font-size:13px;color:#e17055;">离线设备: ${dc.offline.map(d=>escapeHtml(d.name)).join('，')}</div>`;
+  } else {
+    html += `<div style="font-size:13px;color:#00b894;">全部设备在线</div>`;
+  }
+  html += `</div></div></div>`;
+
+  html += `<div class="grid-2"><div class="panel"><div class="panel-header"><h3>📦 补货建议</h3>
+    <button class="btn btn-primary btn-sm" onclick="replenishGeneratePO()">自动生成PO</button></div><div class="panel-body">
+    ${rules.suggestions && rules.suggestions.length ? `<table><thead><tr>
+      <th>配料</th><th>当前库存</th><th>安全库存</th><th>日均用量</th><th>可用天数</th><th>建议补货</th><th>操作</th></tr></thead><tbody>
+    ${rules.suggestions.map(s => `<tr>
+      <td>${escapeHtml(s.ingredient_name)}</td>
+      <td style="color:${s.current_stock<=0?'#e17055':'#2d3436'}">${s.current_stock}</td>
+      <td>${s.safety_stock}</td><td>${s.daily_usage}</td>
+      <td style="color:${s.days_left<3?'#e17055':s.days_left<7?'#fdcb6e':'#00b894'}">${s.days_left}天</td>
+      <td><b>${s.suggested_qty}</b></td>
+      <td><button class="btn btn-sm" onclick="replenishAddToPO(${s.rule_id},${s.ingredient_id},${s.supplier_id},'${escapeHtml(s.ingredient_name)}',${s.suggested_qty})">+添加入PO</button></td>
+    </tr>`).join('')}</tbody></table>` : '<div class="empty">库存充足，无需补货</div>'}
+  </div></div>`;
+
+  html += `<div class="panel"><div class="panel-header"><h3>📉 消耗排行</h3></div><div class="panel-body">
+    ${compras.by_ingredient && compras.by_ingredient.length ? `<table><thead><tr><th>配料</th><th>总消耗</th><th>记录数</th></tr></thead><tbody>
+    ${compras.by_ingredient.slice(0, 10).map(r => `<tr>
+      <td>${escapeHtml(r.ingredient_name)}</td><td><b>${r.total_qty} ${escapeHtml(r.unit||'')}</b></td><td>${r.record_count}</td>
+    </tr>`).join('')}</tbody></table>` : '<div class="empty">暂无消耗数据</div>'}
+  </div></div></div>`;
+
+  document.getElementById('contentArea').innerHTML = html;
+}
+
+window.replenishGeneratePO = async function () {
+  try {
+    const r = await api('api/replenish/generate-po', { method: 'POST' });
+    toast(`已生成 ${r.created} 笔叫货单`);
+    renderSupplyChain();
+  } catch (e) { toast(e.message); }
+};
+
+window.replenishAddToPO = function (ruleId, ingId, supId, name, qty) {
+  navigate('purchase_orders', '叫货管理');
+  setTimeout(() => {
+    if (typeof window.addAlertToPO === 'function') {} // trigger PO page
+  }, 500);
+};
+
 /* ============ 系统配置 ============ */
 function renderSettings() {
   const html = `
@@ -1337,6 +1484,7 @@ async function renderPlatform() {
 /* ============ 路由 ============ */
 const ROUTERS = {
   dashboard: renderDashboard,
+  supplychain: renderSupplyChain,
   platform: renderPlatform,
   orgtree: renderOrgTree,
   settings: renderSettings,
@@ -1469,6 +1617,7 @@ function isMobile() {
 
 const MOBILE_TABS = [
   { id: 'dashboard', icon: '📊', label: '工作台', action: () => navigate('dashboard', '系统概览') },
+  { id: 'supplychain', icon: '🔄', label: '供应链', action: () => navigate('supplychain', '供应链看板') },
   { id: 'business', icon: '🧩', label: '业务', sub: [
     { page: 'ingredients', icon: '🧂', label: '配料管理' },
     { page: 'inventory', icon: '📦', label: '库存管理' },
@@ -1479,6 +1628,12 @@ const MOBILE_TABS = [
     { page: 'expiry', icon: '⏰', label: '效期管理' },
     { page: 'logistics', icon: '🚚', label: '物流管理' },
     { page: 'purchase_orders', icon: '📋', label: '叫货管理' },
+    { page: 'supplychain', icon: '🔄', label: '供应链看板' },
+    { page: 'factories', icon: '🏭', label: '原料工厂' },
+    { page: 'devices', icon: '🖥️', label: '设备管理' },
+    { page: 'consumption', icon: '📉', label: '消耗记录' },
+    { page: 'recipes', icon: '🧋', label: '饮品配方' },
+    { page: 'replenish_rules', icon: '📦', label: '智能补货' },
   ]},
   { id: 'org', icon: '👥', label: '组织', sub: [
     { page: 'orgtree', icon: '🏗️', label: '组织架构' },

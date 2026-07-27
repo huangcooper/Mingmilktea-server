@@ -243,9 +243,11 @@ class Expiry(Base, BaseMixin):
 class Logistics(Base, BaseMixin):
     __tablename__ = "logistics"
     code = mapped_column(String(32), unique=True)
+    logistics_type = mapped_column(String(32), default="供应商→品牌商")  # 工厂→供应商 / 供应商→品牌商 / 品牌商→门店
+    factory_id = mapped_column(Integer, ForeignKey("factories.id"), nullable=True, default=None)
     supplier_id = mapped_column(Integer, ForeignKey("suppliers.id"))
     warehouse = mapped_column(String(64))
-    store_id = mapped_column(Integer, ForeignKey("stores.id"))
+    store_id = mapped_column(Integer, ForeignKey("stores.id"), nullable=True, default=None)
     details = mapped_column(String(256))
     total_weight = mapped_column(String(64))
     logistics_company = mapped_column(String(64))
@@ -279,3 +281,91 @@ class AuditLog(Base, BaseMixin):
     target_id = mapped_column(Integer, default=0)           # 操作对象 id
     detail = mapped_column(String(512), default="")         # 说明
     ip = mapped_column(String(64), default="")              # 来源 IP
+
+
+# ============================================================
+# Phase 6 — 茶饮供应链生态闭环
+# ============================================================
+
+class Factory(Base, BaseMixin, AccountMixin):
+    """原料工厂：茶农 / 糖厂 / 奶源基地 / 种植基地，供应链最上游"""
+    __tablename__ = "factories"
+    code = mapped_column(String(32), unique=True)
+    name = mapped_column(String(128))
+    type = mapped_column(String(32), default="茶农")         # 茶农/糖厂/奶源基地/种植基地/加工厂
+    platform_id = mapped_column(Integer, ForeignKey("platforms.id"))
+    region = mapped_column(String(64))                       # 产地：福建安溪/云南普洱/广西南宁
+    contact = mapped_column(String(64))
+    phone = mapped_column(String(32))
+    annual_capacity = mapped_column(String(64))              # 年产能力：500吨
+    certifications = mapped_column(String(256))              # 资质：有机认证/ISO22000/HACCP
+    quality_rating = mapped_column(Integer, default=0)       # 质量评分 0-100
+    cooperation_start = mapped_column(String(32))
+    status = mapped_column(String(32), default="合作中")     # 合作中/暂停/停用
+
+
+class Recipe(Base, BaseMixin):
+    """饮品配方研发：独立模块，配方的原料消耗作为库存损耗的一种来源"""
+    __tablename__ = "recipes"
+    code = mapped_column(String(32), unique=True)
+    name = mapped_column(String(128))                        # 配方名称：经典奶茶/杨枝甘露
+    version = mapped_column(String(16), default="1.0")      # 版本号
+    category = mapped_column(String(64))                     # 品类：奶茶/果茶/咖啡/冰沙
+    cup_size = mapped_column(String(32), default="中杯500ml")# 杯型规格
+    materials = mapped_column(String(2048))                  # JSON BOM: [{i:配料id, n:名称, q:用量, u:单位}]
+    cost_per_cup = mapped_column(Float, default=0)           # 单杯原料成本
+    sale_price_ref = mapped_column(Float, default=0)         # 建议售价
+    steps = mapped_column(String(2048))                      # 制作步骤（JSON）
+    developer = mapped_column(String(64))                    # 研发人
+    status = mapped_column(String(32), default="研发中")     # 研发中/已定型/已停用
+    remark = mapped_column(String(512))
+
+
+class Device(Base, BaseMixin):
+    """门店设备：奶茶机 / 收银机 / POS，一对多绑门店，MAC 全局唯一"""
+    __tablename__ = "devices"
+    code = mapped_column(String(32), unique=True)
+    name = mapped_column(String(128))                        # 设备名称：鸣智奶茶机-1号
+    store_id = mapped_column(Integer, ForeignKey("stores.id"))
+    mac = mapped_column(String(32), unique=True, index=True) # MAC 地址，全局唯一
+    type = mapped_column(String(32), default="奶茶机")      # 奶茶机/收银机/POS/标签秤
+    model = mapped_column(String(64))                        # 型号：MZ-2000
+    api_key = mapped_column(String(64), unique=True)         # API 鉴权 Key
+    firmware = mapped_column(String(32))                     # 固件版本
+    last_heartbeat = mapped_column(String(32))               # 最后心跳时间
+    online = mapped_column(Boolean, default=False)           # 在线状态
+    ip_address = mapped_column(String(64))                   # 设备IP
+    status = mapped_column(String(32), default="正常")       # 正常/离线/故障/维护
+
+
+class Consumption(Base, BaseMixin):
+    """设备原料消耗记录：设备上报或手动录入，自动关联扣库存"""
+    __tablename__ = "consumption"
+    code = mapped_column(String(32), unique=True)
+    device_id = mapped_column(Integer, ForeignKey("devices.id"))
+    store_id = mapped_column(Integer, ForeignKey("stores.id"))
+    ingredient_id = mapped_column(Integer, ForeignKey("ingredients.id"))
+    quantity = mapped_column(Float, default=0)               # 消耗用量
+    unit = mapped_column(String(32))                         # 单位
+    batch_no = mapped_column(String(64))                     # 批号（追溯用）
+    consume_time = mapped_column(String(32))                 # 消耗时间
+    source = mapped_column(String(32), default="设备上报")   # 设备上报/手动录入/配方消耗
+    recipe_id = mapped_column(Integer, ForeignKey("recipes.id"), nullable=True, default=None)
+    status = mapped_column(String(32), default="已确认")     # 待确认/已确认/已冲正
+
+
+class ReplenishRule(Base, BaseMixin):
+    """自动补货规则：消耗驱动的智能叫货"""
+    __tablename__ = "replenish_rules"
+    code = mapped_column(String(32), unique=True)
+    ingredient_id = mapped_column(Integer, ForeignKey("ingredients.id"))
+    store_id = mapped_column(Integer, ForeignKey("stores.id"), nullable=True, default=None)
+    safety_stock = mapped_column(Float, default=0)           # 安全库存
+    reorder_point = mapped_column(Float, default=0)          # 订货点（触发补货）
+    reorder_qty = mapped_column(Float, default=0)            # 建议补货量
+    supplier_id = mapped_column(Integer, ForeignKey("suppliers.id"))
+    lead_time_days = mapped_column(Integer, default=3)       # 供应商交货提前期(天)
+    avg_daily_usage = mapped_column(Float, default=0)        # 日平均用量（系统自动计算）
+    auto_approve = mapped_column(Boolean, default=False)     # 是否自动审批
+    last_calc_time = mapped_column(String(32))               # 上次计算时间
+    status = mapped_column(String(32), default="启用")       # 启用/停用
