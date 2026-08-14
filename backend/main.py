@@ -20,12 +20,13 @@ from urllib.parse import quote
 import openpyxl
 
 from db import engine, Base, get_db
-from config import DATABASE_URL, IS_SQLITE
+from config import DATABASE_URL, IS_SQLITE, IS_MYSQL
 import models
 
 # 启动时创建表
 Base.metadata.create_all(bind=engine)
-print(f"[DB] 数据库引擎: {'SQLite' if IS_SQLITE else 'PostgreSQL'} — {DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL}")
+_DB_TYPE = "SQLite" if IS_SQLITE else ("MySQL" if IS_MYSQL else "PostgreSQL")
+print(f"[DB] 数据库引擎: {_DB_TYPE} — {DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL}")
 
 
 def migrate():
