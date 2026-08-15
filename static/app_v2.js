@@ -874,9 +874,16 @@ async function renderCategories() {
   const childrenOf = pid => cats.filter(c => (c.parent_id || 0) === pid);
   const root = childrenOf(0);
   const lvlText = l => l === 1 ? '一级' : l === 2 ? '二级' : '三级';
+  // 展开状态集合：默认全部折叠，点击 ▶ 切换
+  const expanded = new Set();
   function nodeHtml(c, depth) {
     const kids = childrenOf(c.id);
+    const isOpen = expanded.has(c.id);
+    const toggle = kids.length
+      ? `<span class="cat-toggle" data-toggle="${c.id}" title="展开/收起" style="cursor:pointer;display:inline-block;width:18px;color:#888;font-weight:bold;user-select:none;">${isOpen ? '▼' : '▶'}</span>`
+      : `<span style="display:inline-block;width:18px;"></span>`;
     const h = `<div class="cat-node" style="margin-left:${depth * 26}px">
+      ${toggle}
       <span class="cat-dot lvl${c.level}"></span>
       <b class="cat-name">${escapeHtml(c.name)}</b>
       <span class="tag tag-default">${lvlText(c.level)}</span>
@@ -887,12 +894,31 @@ async function renderCategories() {
         <button class="btn btn-danger btn-sm" onclick="delItem('categories', ${c.id})">删除</button>
       </span>
     </div>`;
-    return h + (kids.length ? `<div class="cat-children">` + kids.map(k => nodeHtml(k, depth + 1)).join('') + `</div>` : '');
+    return h + (kids.length ? `<div class="cat-children" data-children="${c.id}" style="display:${isOpen ? 'block' : 'none'}">` + kids.map(k => nodeHtml(k, depth + 1)).join('') + `</div>` : '');
   }
   const html = `<div class="panel"><div class="panel-header"><h3>🗂️ 配料类别（三级分类设置）</h3>
       <div class="btn-group"><button class="btn btn-primary btn-sm" onclick="openForm('categories', null, {level:1, parent_id:0})">+ 新增一级分类</button></div></div>
     <div class="panel-body">${root.length ? root.map(c => nodeHtml(c, 0)).join('') : '<div class="empty">暂无分类，点击「+ 新增一级分类」开始</div>'}</div></div>`;
   document.getElementById('contentArea').innerHTML = html;
+
+  // 绑定折叠切换
+  document.querySelectorAll('[data-toggle]').forEach(el => {
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      const id = Number(el.dataset.toggle);
+      const childBox = document.querySelector(`[data-children="${id}"]`);
+      if (!childBox) return;
+      if (expanded.has(id)) {
+        expanded.delete(id);
+        childBox.style.display = 'none';
+        el.textContent = '▶';
+      } else {
+        expanded.add(id);
+        childBox.style.display = 'block';
+        el.textContent = '▼';
+      }
+    });
+  });
 }
 
 /* 配料类别表单：按级别过滤可选父级 */
