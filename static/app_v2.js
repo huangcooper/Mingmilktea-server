@@ -1024,11 +1024,13 @@ async function renderDashboard() {
   let expAlerts = { total: 0, items: [] };
   let wasStats = { total: 0, total_quantity: 0, total_amount: 0, by_type: {}, by_ingredient: {}, by_store: {} };
   let invAlerts = { total: 0, items: [] };
+  let deviceStatus = { total: 0, online: 0 };
   let health = { summary: { negative_stock: 0, expired_backlog: 0, po_logistics_mismatch: 0, low_stock: 0 }, expired_backlog: [], negative_stock: [], low_stock: [], po_logistics_mismatch: [] };
   try {
-    [ings, inv, exp, logs, was, expAlerts, wasStats, invAlerts, health] = await Promise.all([
+    [ings, inv, exp, logs, was, expAlerts, wasStats, invAlerts, health, deviceStatus] = await Promise.all([
       apiGet('ingredients'), apiGet('inventory'), apiGet('expiry'), apiGet('logistics'), apiGet('wastage'),
       apiGet('expiry/alerts'), apiGet('wastage/stats'), apiGet('inventory/alerts'), apiGet('consistency/check'),
+      apiGet('devices/online'),
     ]);
   } catch (e) { toast(e.message); }
 
@@ -1068,6 +1070,7 @@ async function renderDashboard() {
       <div class="stat-card"><div class="stat-icon green">📦</div><div class="stat-info"><h3>${stockTotal.toLocaleString()}</h3><p>库存总量 (kg/L)</p></div></div>
       <div class="stat-card"><div class="stat-icon orange">⚠️</div><div class="stat-info"><h3>${expWarning}</h3><p>临期预警批次</p></div></div>
       <div class="stat-card"><div class="stat-icon red">📉</div><div class="stat-info"><h3>${fmtMoney(wastageAmount)}</h3><p>累计损耗金额</p></div></div>
+      <div class="stat-card"><div class="stat-icon purple">🖥️</div><div class="stat-info"><h3>${deviceStatus.total || 0}<span class="muted" style="font-size:12px;margin-left:4px;">/ ${deviceStatus.online || 0} 在线</span></h3><p>已关联设备数</p></div></div>
     </div>
     <div class="grid-2">
       <div class="panel"><div class="panel-header"><h3>📊 库存概览（按类别）</h3></div>
