@@ -1161,6 +1161,9 @@ def devices_online_status(db: Session = Depends(get_db)):
     offline_devices = [{"id": d.id, "name": d.name, "mac": d.mac, "last_heartbeat": d.last_heartbeat}
                        for d in db.query(models.Device).filter(models.Device.online == False).limit(10).all()]
     return {"total": total, "online": online_count, "by_type": by_type, "offline": offline_devices}
+
+
+@app.get("/api/{entity}")
 def list_items(entity: str, request: Request, db: Session = Depends(get_db)):
     Model = get_model(entity)
     params = dict(request.query_params)
